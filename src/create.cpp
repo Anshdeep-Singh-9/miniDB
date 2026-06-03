@@ -34,6 +34,9 @@ bool parse_column_type(const std::string& input, int& type_out) {
 }
 
 int record_size(table *temp){
+    // What: compute the maximum byte size of one logical row from table metadata.
+    // Why: older metadata code needs this size to validate and describe fixed-width rows.
+    // Example: INT + VARCHAR becomes 4 bytes + varchar capacity in the table schema.
     int size = 0;
     temp->prefix[0] = 0;
     for(int i = 0; i < temp->count; i++){
@@ -55,6 +58,9 @@ int record_size(table *temp){
 // --- NEW AUTOMATED CREATE IMPLEMENTATION ---
 
 void execute_create_query(std::string table_name, std::vector<std::pair<std::string, std::string>> cols) {
+    // What: create the table directory, metadata file, table_list entry, and empty B+ Tree index.
+    // Why: every INSERT/SELECT later depends on this catalog information to know column names/types.
+    // Example: CREATE TABLE students (id INT, name VARCHAR(50), dept VARCHAR(20));
     char t_name[MAX_NAME];
     strcpy(t_name, table_name.c_str());
 
@@ -140,10 +146,9 @@ void execute_create_query(std::string table_name, std::vector<std::pair<std::str
     }
 
     // 5. File System Setup
-    struct stat st = {0};
-    if (stat("./table", &st) == -1) mkdir("./table", 0775);
+    std::filesystem::create_directories(table_root());
 
-    FilePtr fp = fopen("./table/table_list", "a+");
+    FilePtr fp = fopen(table_list_path().string().c_str(), "a+");
     if(fp == NULL){
         std::cout << "ERROR: Could not open central table_list file.\n";
         delete temp;

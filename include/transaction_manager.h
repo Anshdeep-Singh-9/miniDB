@@ -11,6 +11,9 @@ class TransactionManager {
     static bool rollback();
     static bool in_transaction();
     static std::uint64_t current_txn_id();
+    static bool current_transaction_holds_write_lock();
+    static bool current_transaction_aborted();
+    static bool abort_current_due_to_lock(const std::string& reason);
     static std::string last_error();
 
   private:

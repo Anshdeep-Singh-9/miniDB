@@ -29,6 +29,9 @@ enum SpecialKeys {
 };
 
 void HistoryManager::enable_raw_mode() {
+    // What: switch terminal input into character-by-character mode.
+    // Why: readline needs arrow keys, backspace, and history handling before ENTER is pressed.
+    // Example: pressing left arrow moves cursor inside minidb> input instead of printing symbols.
     struct termios raw = orig_termios;
     raw.c_lflag &= ~(ECHO | ICANON | IEXTEN);
     raw.c_iflag &= ~(BRKINT | ICRNL | INPCK | ISTRIP | IXON);
@@ -42,6 +45,9 @@ void HistoryManager::disable_raw_mode() {
 }
 
 int HistoryManager::read_key() {
+    // What: read one key press and translate escape sequences into internal key codes.
+    // Why: arrow keys and Ctrl combinations arrive as multi-byte terminal sequences.
+    // Example: Up arrow becomes KEY_UP so the query console can show previous command.
     int nread;
     char c;
     while ((nread = read(STDIN_FILENO, &c, 1)) != 1) {
@@ -107,6 +113,9 @@ int HistoryManager::read_key() {
 }
 
 std::string HistoryManager::readline(const std::string& prompt) {
+    // What: custom command-line editor for the MiniDB query console.
+    // Why: users need command history, cursor movement, delete, and Ctrl navigation.
+    // Example: type SELECT, press Up to recall old query, then edit before ENTER.
     std::string current_line = "";
     std::string draft = "";
     int cursor_pos = 0;
@@ -240,6 +249,9 @@ std::string HistoryManager::readline(const std::string& prompt) {
 }
 
 void HistoryManager::add_to_history(const std::string& command) {
+    // What: save a command in memory for Up/Down navigation.
+    // Why: repeated SQL testing is faster when previous commands can be recalled.
+    // Example: after INSERT, pressing Up shows that INSERT again.
     if (!command.empty() && (history.empty() || history.back() != command)) {
         history.push_back(command);
     }

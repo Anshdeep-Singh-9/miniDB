@@ -3,6 +3,9 @@
 #include <cstring>
 
 bool compact_page_buffer(char* page_buffer) {
+    // What: compact live tuples inside one slotted page without changing slot ids.
+    // Why: DELETE/large UPDATE can leave holes; INSERT may need contiguous free space again.
+    // Example: slots 0 and 2 stay same, deleted slot 1 remains tombstone, live bytes move together.
     if (page_buffer == NULL) {
         return false;
     }
@@ -54,6 +57,9 @@ bool compact_page_buffer(char* page_buffer) {
 }
 
 void compact_page(uint32_t page_id, DiskManager* disk) {
+    // What: read a page from disk, compact it in RAM, and write it back if changed.
+    // Why: this is the disk-level wrapper around compact_page_buffer().
+    // Example: compact_page(0, disk) cleans fragmentation inside page 0.
     if (disk == NULL) {
         return;
     }

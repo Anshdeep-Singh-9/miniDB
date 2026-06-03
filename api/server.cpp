@@ -118,8 +118,8 @@ crow::json::wvalue table_to_json(const std::string& table_name) {
 }
 
 int main() {
-    AuthManager::init();
     system_check();
+    AuthManager::init();
     crow::SimpleApp app;
 
         auto is_authenticated = [](const crow::request& req) {

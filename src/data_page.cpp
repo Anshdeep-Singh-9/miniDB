@@ -26,6 +26,9 @@ DataPage::DataPage()
 }
 
 void DataPage::initialize(uint32_t page_id) {
+    // What: reset a raw 4 KB page and write its starting header.
+    // Why: a fresh page needs free_start/free_end/slot_count metadata before rows can be packed.
+    // Example: when INSERT needs a new page, initialize(3) creates page 3 as an empty slotted page.
     std::fill(bytes_.begin(), bytes_.end(), 0);
 
     PageHeader header;
@@ -35,6 +38,9 @@ void DataPage::initialize(uint32_t page_id) {
 }
 
 bool DataPage::load_from_buffer(const char* buffer, std::size_t buffer_size) {
+    // What: load page bytes that came from DiskManager or BufferPoolManager.
+    // Why: DataPage works as a helper around raw bytes, not as the owner of disk storage.
+    // Example: SELECT fetches page 0 into RAM, then load_from_buffer lets us read slots from it.
     if (buffer == NULL || buffer_size != bytes_.size()) {
         return false;
     }
@@ -84,12 +90,18 @@ uint16_t DataPage::slot_count() const {
 }
 
 bool DataPage::can_store(std::size_t tuple_size) const {
+    // What: check whether the page has room for tuple bytes plus one slot entry.
+    // Why: slotted pages grow in two directions, so both tuple area and slot directory need space.
+    // Example: a 30-byte tuple needs 30 bytes at the back and one SlotEntry at the front.
     return free_space() >= tuple_size + SLOT_ENTRY_SIZE;
 }
 
 bool DataPage::insert_tuple(const char* tuple_data,
                             uint16_t tuple_size,
                             uint16_t& slot_id_out) {
+    // What: pack one serialized tuple into the page and return its slot id.
+    // Why: RID(page_id, slot_id) needs a stable slot number to locate the row later.
+    // Example: INSERT row bytes into page 2, slot 5, then B+ Tree stores key -> RID(2, 5).
     if (tuple_data == NULL || tuple_size == 0 || !can_store(tuple_size)) {
         return false;
     }
@@ -115,6 +127,9 @@ bool DataPage::insert_tuple(const char* tuple_data,
 }
 
 bool DataPage::read_tuple(uint16_t slot_id, std::vector<char>& tuple_out) const {
+    // What: read raw tuple bytes from a slot.
+    // Why: SELECT/UPDATE/DELETE first locate bytes, then TupleSerializer converts them to values.
+    // Example: slot 0 may point to bytes representing id=1, name="Aryan".
     if (slot_id >= slot_count()) {
         return false;
     }

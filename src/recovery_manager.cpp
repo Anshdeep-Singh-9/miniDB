@@ -10,6 +10,7 @@
 
 #include "BPtree.h"
 #include "disk_manager.h"
+#include "file_handler.h"
 
 namespace fs = std::filesystem;
 
@@ -56,11 +57,14 @@ static uint64_t g_active_txn_id = 0;
 static bool g_txn_active = false;
 
 std::string wal_path_for_table(const std::string& table_name) {
-    return "table/" + table_name + "/wal.log";
+    // What: choose the write-ahead log path for one table.
+    // Why: each table can recover its own page writes independently at restart.
+    // Example: table students uses table/students/wal.log.
+    return table_wal_path(table_name).string();
 }
 
 bool ensure_wal_parent_exists(const std::string& table_name) {
-    const fs::path table_dir = fs::path("table") / table_name;
+    const fs::path table_dir = table_dir_path(table_name);
     if (fs::exists(table_dir)) {
         return true;
     }
@@ -98,7 +102,10 @@ bool is_valid_record_v1(const InsertRedoRecordV1& record) {
 }
 
 bool redo_record(const InsertRedoRecord& record) {
-    std::string data_path = "table/" + std::string(record.table_name) + "/data.dat";
+    // What: replay one committed WAL record by writing its saved page image back to disk.
+    // Why: if MiniDB crashed after logging but before final page write, REDO completes the operation.
+    // Example: pending INSERT record rewrites page 0 and re-syncs primary key -> RID in B+ Tree.
+    std::string data_path = table_data_path(record.table_name).string();
     DiskManager data_disk(data_path, STORAGE_PAGE_SIZE);
     if (!data_disk.open_or_create()) {
         return false;
@@ -170,14 +177,20 @@ bool update_txn_state_for_table(const std::string& table_name,
 }  // namespace
 
 void RecoveryManager::set_transaction_context(std::uint64_t txn_id, bool active) {
+    // What: attach future WAL records to the currently active transaction.
+    // Why: recovery must know whether logged changes were committed or should be ignored/aborted.
+    // Example: after BEGIN, inserts get txn_id=1 until COMMIT/ROLLBACK clears it.
     g_txn_active = active;
     g_active_txn_id = active ? txn_id : 0;
 }
 
 bool RecoveryManager::commit_transaction(std::uint64_t txn_id) {
-    const fs::path table_root("table");
-    if (!fs::exists(table_root) || !fs::is_directory(table_root)) return true;
-    for (fs::directory_iterator it(table_root); it != fs::directory_iterator(); ++it) {
+    // What: mark WAL records of a transaction as committed.
+    // Why: only committed pending records should be replayed during restart recovery.
+    // Example: COMMIT changes txn_committed from 0 to 1 for transaction 3.
+    const fs::path root = table_root();
+    if (!fs::exists(root) || !fs::is_directory(root)) return true;
+    for (fs::directory_iterator it(root); it != fs::directory_iterator(); ++it) {
         const fs::path entry = it->path();
         if (!fs::is_directory(entry)) continue;
         const std::string table_name = entry.filename().string();
@@ -187,9 +200,12 @@ bool RecoveryManager::commit_transaction(std::uint64_t txn_id) {
 }
 
 bool RecoveryManager::abort_transaction(std::uint64_t txn_id) {
-    const fs::path table_root("table");
-    if (!fs::exists(table_root) || !fs::is_directory(table_root)) return true;
-    for (fs::directory_iterator it(table_root); it != fs::directory_iterator(); ++it) {
+    // What: mark WAL records of a transaction as already applied/ignored during abort.
+    // Why: rollback restores snapshot, so recovery should not redo aborted changes later.
+    // Example: ROLLBACK prevents an uncommitted INSERT from being replayed on restart.
+    const fs::path root = table_root();
+    if (!fs::exists(root) || !fs::is_directory(root)) return true;
+    for (fs::directory_iterator it(root); it != fs::directory_iterator(); ++it) {
         const fs::path entry = it->path();
         if (!fs::is_directory(entry)) continue;
         const std::string table_name = entry.filename().string();
@@ -204,6 +220,9 @@ RecoveryTicket RecoveryManager::log_page_redo(const std::string& table_name,
                                               int primary_key,
                                               const char* page_bytes,
                                               bool sync_index) {
+    // What: append a full-page REDO record before the page is considered safely written.
+    // Why: this is the write-ahead logging rule: log first, then apply page change.
+    // Example: INSERT logs the final page image, then dirty page is flushed to data.dat.
     if (page_bytes == NULL || !ensure_wal_parent_exists(table_name)) {
         return RecoveryTicket();
     }
@@ -252,6 +271,9 @@ RecoveryTicket RecoveryManager::log_insert_redo(const std::string& table_name,
 }
 
 bool RecoveryManager::mark_page_applied(const RecoveryTicket& ticket) {
+    // What: mark a WAL record as completed after the page write succeeds.
+    // Why: recovery should only redo records that were logged but not confirmed applied.
+    // Example: after disk.write_page succeeds, applied becomes 1 in wal.log.
     if (!ticket.valid) {
         return false;
     }
@@ -279,13 +301,16 @@ bool RecoveryManager::mark_insert_applied(const RecoveryTicket& ticket) {
 }
 
 bool RecoveryManager::recover_all_tables() {
-    const fs::path table_root("table");
-    if (!fs::exists(table_root) || !fs::is_directory(table_root)) {
+    // What: scan all table directories and run recovery for each table.
+    // Why: MiniDB restart should repair every table automatically before accepting queries.
+    // Example: start_system() calls this once during boot.
+    const fs::path root = table_root();
+    if (!fs::exists(root) || !fs::is_directory(root)) {
         return true;
     }
 
     bool success = true;
-    for (fs::directory_iterator it(table_root); it != fs::directory_iterator(); ++it) {
+    for (fs::directory_iterator it(root); it != fs::directory_iterator(); ++it) {
         const fs::path entry = it->path();
         if (!fs::is_directory(entry)) {
             continue;
@@ -306,6 +331,9 @@ bool RecoveryManager::recover_all_tables() {
 }
 
 bool RecoveryManager::recover_table(const std::string& table_name) {
+    // What: read one table's WAL, redo committed pending records, then truncate the log.
+    // Why: this gives crash recovery for page writes that were logged but not completed.
+    // Example: if crash happens after WAL during INSERT, restart replays the saved page bytes.
     const std::string wal_path = wal_path_for_table(table_name);
     if (!fs::exists(wal_path)) {
         return true;
@@ -382,6 +410,9 @@ bool RecoveryManager::recover_table(const std::string& table_name) {
 }
 
 void RecoveryManager::maybe_crash_after_wal(const char* operation) {
+    // What: testing failpoint that intentionally aborts after WAL is written.
+    // Why: it lets us prove recovery without actually powering off the machine.
+    // Example: MINIDB_CRASH_AFTER_WAL=insert ./miniDB simulates crash after insert log.
     const char* failpoint = std::getenv("MINIDB_CRASH_AFTER_WAL");
     if (failpoint == NULL || operation == NULL) {
         return;
