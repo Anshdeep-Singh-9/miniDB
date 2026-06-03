@@ -1,11 +1,15 @@
 #include "BPtree.h"
 #include "declaration.h"
+#include "file_handler.h"
 #include <iostream>
 #include <algorithm>
 #include <cstring>
 
 BPtreeNode::BPtreeNode(uint32_t id, bool leaf)
     : is_leaf(leaf), num_keys(0), page_id(id), next_page_id(INVALID_PAGE_ID), prev_page_id(INVALID_PAGE_ID) {
+    // What: initialize one index page as either a leaf node or internal node.
+    // Why: B+ Tree pages must start with empty keys, empty children, and invalid links.
+    // Example: first INSERT creates a leaf root node with no keys initially.
     for (int i = 0; i < MAX_KEYS; ++i) {
         keys[i] = 0;
         values[i] = RID();
@@ -16,6 +20,9 @@ BPtreeNode::BPtreeNode(uint32_t id, bool leaf)
 }
 
 void BPtreeNode::serialize(char* buffer) const {
+    // What: convert one B+ Tree node into fixed-size page bytes.
+    // Why: index nodes are stored in index.dat through DiskManager pages.
+    // Example: keys [10, 20] and their RIDs are copied into a 4 KB buffer.
     std::memset(buffer, 0, STORAGE_PAGE_SIZE);
     char* ptr = buffer;
     
@@ -36,6 +43,9 @@ void BPtreeNode::serialize(char* buffer) const {
 }
 
 void BPtreeNode::deserialize(const char* buffer) {
+    // What: rebuild one B+ Tree node object from page bytes.
+    // Why: search/insert reads index pages from disk and needs usable C++ fields.
+    // Example: page bytes from index.dat become keys, children, and RID values.
     const char* ptr = buffer;
     
     uint32_t leaf_val;
@@ -58,7 +68,10 @@ void BPtreeNode::deserialize(const char* buffer) {
 
 BPtree::BPtree(const char* table_name) 
     : root_page_id_(INVALID_PAGE_ID), table_name_(table_name) {
-    std::string index_path = "table/" + table_name_ + "/index.dat";
+    // What: open the table's index file and load the root-page pointer.
+    // Why: every table has its own primary-key index stored as table/<name>/index.dat.
+    // Example: BPtree("students") manages table/students/index.dat.
+    std::string index_path = table_index_path(table_name_).string();
     disk_manager_ = new DiskManager(index_path);
     if (disk_manager_->open_or_create()) {
         load_root();
@@ -111,6 +124,9 @@ void BPtree::write_node(const BPtreeNode& node) {
 }
 
 RID BPtree::search(int key) {
+    // What: find the RID stored for a primary-key value.
+    // Why: SELECT/UPDATE/DELETE on primary key should jump directly to page and slot.
+    // Example: key 5 returns RID(0, 3), meaning row is in data page 0 slot 3.
     if (root_page_id_ == INVALID_PAGE_ID) return RID();
     
     uint32_t curr_id = root_page_id_;
@@ -137,6 +153,9 @@ int BPtree::get_record(int key) {
 }
 
 bool BPtree::update_rid(int key, RID new_rid) {
+    // What: update the stored row location for an existing primary key.
+    // Why: large UPDATE may relocate a tuple to a new slot, so index must point to the new RID.
+    // Example: key 5 changes from RID(0, 3) to RID(2, 0).
     if (root_page_id_ == INVALID_PAGE_ID) return false;
 
     // Traverse to the leaf node that should contain this key
@@ -164,6 +183,9 @@ bool BPtree::update_rid(int key, RID new_rid) {
 }
 
 bool BPtree::remove_key(int key) {
+    // What: remove a primary-key entry from the leaf node.
+    // Why: DELETE should stop future indexed searches from returning a tombstoned row.
+    // Example: DELETE WHERE id = 5 removes key 5 from index.dat.
     if (root_page_id_ == INVALID_PAGE_ID) return false;
 
     // Traverse to the leaf that should contain this key
@@ -201,6 +223,9 @@ int BPtree::insert_record(int key, int record_num) {
 }
 
 void BPtree::insert(int key, RID rid) {
+    // What: insert primary key -> RID into the B+ Tree, splitting nodes if required.
+    // Why: the index must stay sorted so future point lookups can navigate quickly.
+    // Example: INSERT id=10 at RID(0, 1) stores 10 -> RID(0, 1).
     if (root_page_id_ == INVALID_PAGE_ID) {
         root_page_id_ = allocate_node(true);
         BPtreeNode root_node;
@@ -244,6 +269,9 @@ void BPtree::insert_into_leaf(BPtreeNode& leaf, int key, RID rid) {
 }
 
 void BPtree::split_leaf(BPtreeNode& leaf, int key, RID rid) {
+    // What: split a full leaf into two leaves and push separator key upward.
+    // Why: B+ Tree nodes have fixed capacity, so overflow must be handled structurally.
+    // Example: inserting a fifth key into a 4-key leaf creates a new right leaf.
     int temp_keys[MAX_KEYS + 1];
     RID temp_values[MAX_KEYS + 1];
     int i = 0;

@@ -4,11 +4,14 @@
 #include "disk_manager.h"
 #include "display.h"
 #include "file_handler.h"
+#include "lock_manager.h"
 #include "storage_types.h"
+#include "transaction_manager.h"
 #include "tuple_serializer.h"
 
 #include <cstring>
 #include <iostream>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -19,12 +22,76 @@
 #define YELLOW "\033[33m"
 #define CYAN   "\033[36m"
 
+namespace {
+
+class ExclusiveRowLockGuard {
+  public:
+    ExclusiveRowLockGuard(const std::string& table_name, const RID& rid)
+        : table_name_(table_name), rid_(rid), locked_(false), transaction_lock_(false), ok_(true) {
+        if (rid_.page_id != INVALID_PAGE_ID && rid_.slot_id != INVALID_SLOT_ID) {
+            if (TransactionManager::in_transaction()) {
+                transaction_lock_ = true;
+                ok_ = LockManager::acquireExclusive(TransactionManager::current_txn_id(),
+                                                    table_name_, rid_);
+                if (!ok_) {
+                    TransactionManager::abort_current_due_to_lock(
+                        LockManager::abort_reason(TransactionManager::current_txn_id()));
+                }
+            } else {
+                LockManager::lock_row_exclusive(table_name_, rid_);
+                locked_ = true;
+            }
+        }
+    }
+
+    ~ExclusiveRowLockGuard() {
+        if (locked_ && !transaction_lock_) {
+            LockManager::unlock_row_exclusive(table_name_, rid_);
+        }
+    }
+
+    bool ok() const { return ok_; }
+
+  private:
+    std::string table_name_;
+    RID rid_;
+    bool locked_;
+    bool transaction_lock_;
+    bool ok_;
+};
+
+class ExclusivePageLockGuard {
+  public:
+    ExclusivePageLockGuard(const std::string& table_name, uint32_t page_id)
+        : table_name_(table_name), page_id_(page_id), locked_(false) {
+        if (page_id_ != INVALID_PAGE_ID) {
+            LockManager::lock_page_exclusive(table_name_, page_id_);
+            locked_ = true;
+        }
+    }
+
+    ~ExclusivePageLockGuard() {
+        if (locked_) {
+            LockManager::unlock_page_exclusive(table_name_, page_id_);
+        }
+    }
+
+  private:
+    std::string table_name_;
+    uint32_t page_id_;
+    bool locked_;
+};
+
+}  // namespace
+
 static int delete_via_bptree(const std::string& tab_name,
                              const std::vector<ColumnSchema>& schema,
                              const DeleteStatement& stmt) {
+    // What: delete one row by using the primary-key B+ Tree to find its RID.
+    // Why: primary-key DELETE should avoid scanning every page when the index already has location.
+    // Example: DELETE FROM students WHERE id = 7; goes key 7 -> RID(page, slot).
     (void)schema;
     std::cout << CYAN << "\n[Delete Strategy: B+ Tree Lookup on Primary Key]" << RESET << "\n";
-
     int pk_value;
     try {
         size_t used = 0;
@@ -46,7 +113,14 @@ static int delete_via_bptree(const std::string& tab_name,
         return 0;
     }
 
-    std::string data_path = "table/" + tab_name + "/data.dat";
+    ExclusivePageLockGuard page_lock(tab_name, rid.page_id);
+    ExclusiveRowLockGuard row_lock(tab_name, rid);
+    if (!row_lock.ok()) {
+        std::cout << RED << TransactionManager::last_error() << RESET << "\n";
+        return 0;
+    }
+
+    std::string data_path = table_data_path(tab_name).string();
     DiskManager disk(data_path);
     if (!disk.open_or_create()) {
         std::cout << RED << "Error: Cannot open data file." << RESET << "\n";
@@ -90,9 +164,12 @@ static int delete_via_linear_scan(const std::string& tab_name,
                                   const std::vector<ColumnSchema>& schema,
                                   const DeleteStatement& stmt,
                                   int where_col_idx) {
+    // What: delete all matching rows by scanning every page and slot.
+    // Why: non-primary columns are not indexed, so the engine must inspect rows one by one.
+    // Example: DELETE FROM students WHERE dept = CSE; checks every tuple's dept value.
     std::cout << CYAN << "\n[Delete Strategy: Linear Scan]" << RESET << "\n";
 
-    std::string data_path = "table/" + tab_name + "/data.dat";
+    std::string data_path = table_data_path(tab_name).string();
     DiskManager disk(data_path);
     if (!disk.open_or_create()) {
         std::cout << RED << "Error: Cannot open data file." << RESET << "\n";
@@ -101,8 +178,8 @@ static int delete_via_linear_scan(const std::string& tab_name,
 
     BPtree index(tab_name.c_str());
     int deleted_count = 0;
-
     for (uint32_t page_id = 0; page_id < disk.page_count(); ++page_id) {
+        ExclusivePageLockGuard page_lock(tab_name, page_id);
         char buf[STORAGE_PAGE_SIZE];
         if (!disk.read_page(page_id, buf)) continue;
 
@@ -110,14 +187,14 @@ static int delete_via_linear_scan(const std::string& tab_name,
         dp.load_from_buffer(buf, STORAGE_PAGE_SIZE);
 
         bool page_dirty = false;
+        std::vector<std::unique_ptr<ExclusiveRowLockGuard>> row_locks;
+        bool lock_failed = false;
 
         for (uint16_t slot_id = 0; slot_id < dp.slot_count(); ++slot_id) {
             std::vector<char> old_bytes;
             if (!dp.read_tuple(slot_id, old_bytes)) continue;
-
             std::vector<TupleValue> values;
             if (!TupleSerializer::deserialize(schema, old_bytes, values)) continue;
-
             const TupleValue& cell = values[where_col_idx];
             bool matches = false;
             if (cell.type == STORAGE_COLUMN_INT) {
@@ -129,6 +206,13 @@ static int delete_via_linear_scan(const std::string& tab_name,
 
             if (!matches) continue;
 
+            RID current_rid(page_id, slot_id);
+            row_locks.emplace_back(new ExclusiveRowLockGuard(tab_name, current_rid));
+            if (!row_locks.back()->ok()) {
+                lock_failed = true;
+                break;
+            }
+
             SlotEntry* slots = reinterpret_cast<SlotEntry*>(buf + sizeof(PageHeader));
             slots[slot_id].length = 0;
             page_dirty = true;
@@ -136,6 +220,10 @@ static int delete_via_linear_scan(const std::string& tab_name,
             int pk_value = values[0].int_value;
             index.remove_key(pk_value);
             deleted_count++;
+        }
+
+        if (lock_failed) {
+            return 0;
         }
 
         if (page_dirty) {
@@ -168,6 +256,9 @@ static int delete_via_linear_scan(const std::string& tab_name,
 }
 
 void execute_delete(const DeleteStatement& stmt) {
+    // What: validate DELETE, build schema, then choose B+ Tree or linear-scan strategy.
+    // Why: parser should only parse syntax; this function owns the execution decision.
+    // Example: WHERE id uses B+ Tree, WHERE name uses linear scan.
     char tab[MAX_NAME];
     strncpy(tab, stmt.table_name.c_str(), MAX_NAME - 1);
     tab[MAX_NAME - 1] = '\0';

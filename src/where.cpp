@@ -5,8 +5,12 @@
 #include "disk_manager.h"
 #include "display.h"
 #include "file_handler.h"
+#include "lock_manager.h"
+#include "transaction_manager.h"
 #include "tuple_serializer.h"
 
+#include <algorithm>
+#include <cctype>
 #include <iomanip>
 #include <iostream>
 #include <string>
@@ -18,7 +22,72 @@
 #define BLUE    "\033[34m"
 #define WHITE   "\033[97m"
 
+namespace {
+
+class SharedPageLockGuard {
+  public:
+    SharedPageLockGuard(const std::string& table_name, uint32_t page_id)
+        : table_name_(table_name), page_id_(page_id), locked_(false) {
+        if (page_id_ != INVALID_PAGE_ID) {
+            LockManager::lock_page_shared(table_name_, page_id_);
+            locked_ = true;
+        }
+    }
+
+    ~SharedPageLockGuard() {
+        if (locked_) {
+            LockManager::unlock_page_shared(table_name_, page_id_);
+        }
+    }
+
+  private:
+    std::string table_name_;
+    uint32_t page_id_;
+    bool locked_;
+};
+
+class SharedRowLockGuard {
+  public:
+    SharedRowLockGuard(const std::string& table_name, const RID& rid)
+        : table_name_(table_name), rid_(rid), locked_(false), transaction_lock_(false), ok_(true) {
+        if (rid_.page_id != INVALID_PAGE_ID && rid_.slot_id != INVALID_SLOT_ID) {
+            if (TransactionManager::in_transaction()) {
+                transaction_lock_ = true;
+                ok_ = LockManager::acquireShared(TransactionManager::current_txn_id(),
+                                                 table_name_, rid_);
+                if (!ok_) {
+                    TransactionManager::abort_current_due_to_lock(
+                        LockManager::abort_reason(TransactionManager::current_txn_id()));
+                }
+            } else {
+                LockManager::lock_row_shared(table_name_, rid_);
+                locked_ = true;
+            }
+        }
+    }
+
+    ~SharedRowLockGuard() {
+        if (locked_ && !transaction_lock_) {
+            LockManager::unlock_row_shared(table_name_, rid_);
+        }
+    }
+
+    bool ok() const { return ok_; }
+
+  private:
+    std::string table_name_;
+    RID rid_;
+    bool locked_;
+    bool transaction_lock_;
+    bool ok_;
+};
+
+}  // namespace
+
 static std::string remove_quotes_local(std::string s) {
+    // What: trim and remove matching quotes from a WHERE value.
+    // Why: users may type dept = "CSE" or dept = CSE, but comparison should use CSE.
+    // Example: "\"Aryan\"" becomes "Aryan".
     while (!s.empty() && isspace((unsigned char)s.front())) {
         s.erase(s.begin());
     }
@@ -98,9 +167,64 @@ static std::vector<TupleValue> project_row(const std::vector<TupleValue>& values
     return projected;
 }
 
+struct AggregateExprLocal {
+    std::string func;
+    std::string column;
+};
+
+struct SelectItemLocal {
+    bool is_aggregate = false;
+    std::string column;
+};
+
+static std::string to_lower_local(std::string s) {
+    for (std::size_t i = 0; i < s.size(); ++i) {
+        s[i] = static_cast<char>(std::tolower(static_cast<unsigned char>(s[i])));
+    }
+    return s;
+}
+
+static bool parse_aggregate_expr_local(const std::string& token, AggregateExprLocal& expr) {
+    std::string lower = to_lower_local(token);
+    const char* funcs[] = {"count", "sum", "avg", "min", "max"};
+    for (std::size_t i = 0; i < 5; ++i) {
+        const std::string prefix = std::string(funcs[i]) + "(";
+        if (lower.size() > prefix.size() + 1 &&
+            lower.compare(0, prefix.size(), prefix) == 0 &&
+            lower[lower.size() - 1] == ')') {
+            expr.func = funcs[i];
+            expr.column = token.substr(prefix.size(), token.size() - prefix.size() - 1);
+            return true;
+        }
+    }
+    return false;
+}
+
+static void parse_select_items_local(const std::vector<std::string>& target_cols,
+                                     std::vector<SelectItemLocal>& items,
+                                     bool& has_aggregate) {
+    items.clear();
+    has_aggregate = false;
+    for (std::size_t i = 0; i < target_cols.size(); ++i) {
+        AggregateExprLocal expr;
+        SelectItemLocal item;
+        if (parse_aggregate_expr_local(target_cols[i], expr)) {
+            item.is_aggregate = true;
+            item.column = expr.column;
+            has_aggregate = true;
+        } else {
+            item.column = target_cols[i];
+        }
+        items.push_back(item);
+    }
+}
+
 static bool row_matches_where(const std::vector<TupleValue>& values,
                               int where_col_idx,
                               const WhereClause& where) {
+    // What: compare one deserialized row value against the WHERE condition.
+    // Why: linear scan needs a reusable row-level predicate check.
+    // Example: for WHERE dept = CSE, compare the dept column's string with "CSE".
     const TupleValue& cell = values[where_col_idx];
     std::string where_value = remove_quotes_local(where.value);
 
@@ -122,6 +246,9 @@ static void search_via_bptree(const std::string& tab_name,
                               const std::vector<ColumnSchema>& output_schema,
                               const WhereClause& where,
                               QueryResult* res) {
+    // What: find one row using primary-key index, then fetch its page and slot.
+    // Why: indexed point lookup is much faster than scanning every tuple.
+    // Example: SELECT * FROM students WHERE id = 10; uses B+ Tree key 10.
     std::cout << "\n[Search Strategy: B+ Tree Point Lookup on Primary Key]\n";
 
     int pk_value;
@@ -143,9 +270,20 @@ static void search_via_bptree(const std::string& tab_name,
     RID rid = index.search(pk_value);
 
     std::vector<std::vector<TupleValue>> output_rows;
+    std::vector<std::vector<TupleValue>> matched_rows;
 
     if (rid.page_id != INVALID_PAGE_ID) {
-        std::string data_path = "table/" + tab_name + "/data.dat";
+        SharedPageLockGuard page_lock(tab_name, rid.page_id);
+        SharedRowLockGuard row_lock(tab_name, rid);
+        if (!row_lock.ok()) {
+            if (res) {
+                res->success = false;
+                res->message = TransactionManager::last_error();
+            }
+            std::cout << TransactionManager::last_error() << "\n";
+            return;
+        }
+        std::string data_path = table_data_path(tab_name).string();
 
         DiskManager data_disk(data_path);
         if (!data_disk.open_or_create()) {
@@ -196,6 +334,7 @@ static void search_via_bptree(const std::string& tab_name,
             return;
         }
 
+        matched_rows.push_back(values);
         output_rows.push_back(project_row(values, col_indices_to_print));
         buffer_pool.unpin_page(rid.page_id, false);
     }
@@ -204,10 +343,14 @@ static void search_via_bptree(const std::string& tab_name,
         res->is_select = true;
         res->schema = output_schema;
         res->rows = output_rows;
+        res->source_schema = schema;
+        res->source_rows = matched_rows;
         res->strategy = "B+ Tree Point Lookup";
     }
 
-    print_result_table(output_schema, output_rows);
+    if (res == nullptr) {
+        print_result_table(output_schema, output_rows);
+    }
 }
 
 static void search_via_linear_scan(const std::string& tab_name,
@@ -217,9 +360,12 @@ static void search_via_linear_scan(const std::string& tab_name,
                                    const WhereClause& where,
                                    int where_col_idx,
                                    QueryResult* res) {
+    // What: scan every page and slot to find rows matching WHERE.
+    // Why: non-primary columns do not have an index in the current engine.
+    // Example: SELECT * FROM students WHERE dept = CSE; checks every row.
     std::cout << "\n[Search Strategy: Linear Scan]\n";
 
-    std::string data_path = "table/" + tab_name + "/data.dat";
+    std::string data_path = table_data_path(tab_name).string();
 
     DiskManager data_disk(data_path);
     if (!data_disk.open_or_create()) {
@@ -233,8 +379,11 @@ static void search_via_linear_scan(const std::string& tab_name,
 
     BufferPoolManager buffer_pool(4, &data_disk);
     std::vector<std::vector<TupleValue>> output_rows;
+    std::vector<std::vector<TupleValue>> matched_rows;
+    bool lock_failed = false;
 
-    for (uint32_t i = 0; i < data_disk.page_count(); ++i) {
+    for (uint32_t i = 0; i < data_disk.page_count() && !lock_failed; ++i) {
+        SharedPageLockGuard page_lock(tab_name, i);
         char *page_buffer = buffer_pool.fetch_page(i);
 
         if (page_buffer == NULL) {
@@ -245,6 +394,13 @@ static void search_via_linear_scan(const std::string& tab_name,
         page.load_from_buffer(page_buffer, STORAGE_PAGE_SIZE);
 
         for (uint16_t slot_id = 0; slot_id < page.slot_count(); ++slot_id) {
+            RID rid(i, slot_id);
+            SharedRowLockGuard row_lock(tab_name, rid);
+            if (!row_lock.ok()) {
+                lock_failed = true;
+                break;
+            }
+
             std::vector<char> tuple_data;
 
             if (!page.read_tuple(slot_id, tuple_data)) {
@@ -258,6 +414,7 @@ static void search_via_linear_scan(const std::string& tab_name,
             }
 
             if (row_matches_where(values, where_col_idx, where)) {
+                matched_rows.push_back(values);
                 output_rows.push_back(project_row(values, col_indices_to_print));
             }
         }
@@ -265,20 +422,36 @@ static void search_via_linear_scan(const std::string& tab_name,
         buffer_pool.unpin_page(i, false);
     }
 
+    if (lock_failed) {
+        if (res) {
+            res->success = false;
+            res->message = TransactionManager::last_error();
+        }
+        std::cout << TransactionManager::last_error() << "\n";
+        return;
+    }
+
     if (res) {
         res->is_select = true;
         res->schema = output_schema;
         res->rows = output_rows;
+        res->source_schema = schema;
+        res->source_rows = matched_rows;
         res->strategy = "Linear Scan";
     }
 
-    print_result_table(output_schema, output_rows);
+    if (res == nullptr) {
+        print_result_table(output_schema, output_rows);
+    }
 }
 
 void execute_select_where(const std::string& tab_name,
                           const std::vector<std::string>& target_cols,
                           const WhereClause& where,
                           QueryResult* res) {
+    // What: validate SELECT-WHERE and choose indexed lookup or linear scan.
+    // Why: the same SQL syntax can have very different execution cost depending on column indexed.
+    // Example: WHERE id uses B+ Tree; WHERE dept uses linear scan.
     char tab[MAX_NAME];
     strncpy(tab, tab_name.c_str(), MAX_NAME - 1);
     tab[MAX_NAME - 1] = '\0';
@@ -325,8 +498,37 @@ void execute_select_where(const std::string& tab_name,
 
     bool select_all = (target_cols.size() == 1 && target_cols[0] == "*");
     std::vector<int> col_indices_to_print;
+    std::vector<SelectItemLocal> select_items;
+    bool aggregate_query = false;
+    parse_select_items_local(target_cols, select_items, aggregate_query);
 
-    if (select_all) {
+    if (aggregate_query) {
+        for (std::size_t a = 0; a < select_items.size(); ++a) {
+            if (select_items[a].column == "*") {
+                continue;
+            }
+            bool found = false;
+            for (int i = 0; i < meta->count; i++) {
+                if (select_items[a].column == meta->col[i].col_name) {
+                    if (std::find(col_indices_to_print.begin(), col_indices_to_print.end(), i) ==
+                        col_indices_to_print.end()) {
+                        col_indices_to_print.push_back(i);
+                    }
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                if (res) {
+                    res->success = false;
+                    res->message = "Error: Column '" + select_items[a].column + "' does not exist.";
+                }
+                std::cout << "Error: Column '" << select_items[a].column << "' does not exist.\n";
+                delete meta;
+                return;
+            }
+        }
+    } else if (select_all) {
         for (int i = 0; i < meta->count; i++) {
             col_indices_to_print.push_back(i);
         }

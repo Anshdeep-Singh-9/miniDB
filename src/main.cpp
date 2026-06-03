@@ -31,20 +31,31 @@ void system_check();
 #define WHITE   "\033[97m"
 
 void clear_screen() {
+    // What: clear the terminal before printing a fresh screen.
+    // Why: the CLI is menu-driven, so old output should not visually mix with the next screen.
+    // Example: after returning from Query Console, the main menu is redrawn cleanly.
     system("clear");
 }
 
 void print_line() {
+    // What: print the main visual separator line.
+    // Why: it gives the terminal UI a clear boundary between banner, menu, and sections.
+    // Example: printed above and below the MiniDB banner.
     cout << CYAN << "======================================================================" << RESET << "\n";
 }
 
 void print_small_line() {
+    // What: print a smaller section separator.
+    // Why: help text and syntax guides become easier to scan in the terminal.
+    // Example: used between "Syntax Guide" heading and sample SQL commands.
     cout << DIM << "----------------------------------------------------------------------" << RESET << "\n";
 }
 
 void pause_screen(bool clearLeftoverNewline = false) {
+    // What: wait for ENTER before moving to the next screen.
+    // Why: without pause, result output would disappear immediately after menu actions.
+    // Example: after showing metadata, user presses ENTER to return to the main menu.
     cout << DIM << "\nPress ENTER to continue..." << RESET;
-
     cin.clear();
 
     if (clearLeftoverNewline) {
@@ -55,6 +66,9 @@ void pause_screen(bool clearLeftoverNewline = false) {
 }
 
 void print_banner() {
+    // What: render the MiniDB title and feature tagline.
+    // Why: every screen starts with the same identity and context for the CLI monitor.
+    // Example: shows "Storage Engine | B+ Tree Index | Buffer Pool | SQL Parser".
     print_line();
 
     cout << BOLD << CYAN;
@@ -72,6 +86,9 @@ void print_banner() {
 }
 
 void print_section(string title) {
+    // What: start a named screen by clearing terminal, printing banner, then section title.
+    // Why: menu options share the same layout but different section names.
+    // Example: print_section("Query Console") opens the SQL console screen.
     clear_screen();
     print_banner();
 
@@ -80,8 +97,10 @@ void print_section(string title) {
 }
 
 void help() {
+    // What: show supported SQL-like commands and execution notes.
+    // Why: users need quick syntax reference without reading README or source code.
+    // Example: lists CREATE, INSERT, SELECT WHERE, JOIN, UPDATE, DELETE, transactions.
     print_section("Help");
-
     cout << BOLD << "MiniDB Supported Operations\n" << RESET;
     print_small_line();
 
@@ -95,9 +114,17 @@ void help() {
     print_small_line();
 
     cout << GREEN << "SHOW TABLES;\n" << RESET;
+    cout << GREEN << "SHOW DATABASES;\n" << RESET;
+    cout << GREEN << "SHOW USERS;\n" << RESET;
+    cout << GREEN << "CREATE DATABASE semester4;\n" << RESET;
     cout << GREEN << "CREATE TABLE students (id INT, name VARCHAR(50), dept VARCHAR(20));\n" << RESET;
+    cout << GREEN << "CREATE USER administrator IDENTIFIED BY \"pass123\";\n" << RESET;
     cout << GREEN << "INSERT INTO students VALUES (1, \"Aditya\", \"CSE\");\n" << RESET;
     cout << GREEN << "SELECT * FROM Students WHERE ID = 1;\n" << RESET;
+    cout << GREEN << "SELECT * FROM students ORDER BY name;\n" << RESET;
+    cout << GREEN << "SELECT * FROM students LIMIT 5;\n" << RESET;
+    cout << GREEN << "SELECT COUNT(*) FROM students;\n" << RESET;
+    cout << GREEN << "SELECT SUM(id), AVG(id), MIN(name), MAX(name) FROM students;\n" << RESET;
     cout << GREEN << "SELECT s.name, d.hod FROM students JOIN departments ON students.dept = departments.code;\n" << RESET;
     cout << GREEN << "SELECT s.name, d.hod FROM students LEFT JOIN departments ON students.dept = departments.code;\n" << RESET;
     cout << GREEN << "SELECT * FROM Students WHERE Dept = CSE;\n" << RESET;
@@ -106,9 +133,11 @@ void help() {
     cout << GREEN << "DELETE FROM Students WHERE ID = 1;\n" << RESET;
     cout << GREEN << "DELETE FROM Students WHERE Dept = CSE;\n" << RESET;
     cout << GREEN << "DROP TABLE Students;\n" << RESET;
+    cout << GREEN << "DROP DATABASE semester4;\n" << RESET;
     cout << GREEN << "BEGIN;\n" << RESET;
     cout << GREEN << "COMMIT;\n" << RESET;
     cout << GREEN << "ROLLBACK;\n" << RESET;
+    cout << GREEN << "USE semester4;\n" << RESET;
 
     cout << "\n" << BOLD << "Notes\n" << RESET;
     print_small_line();
@@ -129,7 +158,11 @@ void help() {
     print_small_line();
 }
 
+
 int take_input_option() {
+    // What: read and validate the main menu choice.
+    // Why: only options 1-5 are valid; invalid input should not crash or enter wrong flow.
+    // Example: input "1" opens Query Console, input "abc" shows invalid choice.
     string option;
 
     print_line();
@@ -156,7 +189,12 @@ int take_input_option() {
     return option[0] - '0';
 }
 
+
+
 string normalize_console_command(string s) {
+    // What: normalize only control commands typed inside Query Console.
+    // Why: BACK, back;, and "  Exit  " should all be understood as exit commands.
+    // Example: "BACK;" becomes "back"; normal SQL is still passed unchanged to parser.
     while (!s.empty() && isspace((unsigned char)s.front())) {
         s.erase(s.begin());
     }
@@ -177,10 +215,14 @@ string normalize_console_command(string s) {
 }
 
 void print_query_console_syntax() {
+    // What: print short examples directly above the query prompt.
+    // Why: MiniDB syntax is limited, so visible examples prevent common input mistakes.
+    // Example: user can copy CREATE TABLE students (...) from this guide.
     cout << BOLD << "Syntax Guide\n" << RESET;
     print_small_line();
 
     cout << GREEN << "SHOW TABLES;\n" << RESET;
+    cout << GREEN << "SHOW DATABASES;\n" << RESET;
     cout << GREEN << "CREATE TABLE students (id INT, name VARCHAR(50), dept VARCHAR(20));\n" << RESET;
     cout << GREEN << "INSERT INTO students VALUES (1, \"Aditya\", \"CSE\");\n" << RESET;
     cout << GREEN << "SELECT * FROM students;\n" << RESET;
@@ -192,6 +234,9 @@ void print_query_console_syntax() {
     cout << GREEN << "DELETE FROM students WHERE id = 1;\n" << RESET;
     cout << GREEN << "DELETE FROM students WHERE dept = CSE;\n" << RESET;
     cout << GREEN << "DROP TABLE students;\n" << RESET;
+    cout << GREEN << "DROP DATABASE semester4;\n" << RESET;
+    cout << GREEN << "DROP USER administrator;\n" << RESET;
+    cout << GREEN << "USE semester4;\n" << RESET;
     cout << GREEN << "BEGIN;\n" << RESET;
     cout << GREEN << "COMMIT;\n" << RESET;
     cout << GREEN << "ROLLBACK;\n" << RESET;
@@ -202,6 +247,9 @@ void print_query_console_syntax() {
 HistoryManager history_manager;
 
 void query_console_loop() {
+    // What: interactive SQL-like console loop.
+    // Why: this is the main user-facing path for CREATE/INSERT/SELECT/UPDATE/DELETE/JOIN.
+    // Example: user types INSERT INTO students VALUES (1, "Aryan", "CSE");
     cin.ignore(numeric_limits<streamsize>::max(), '\n');
 
     while (true) {
@@ -230,9 +278,11 @@ void query_console_loop() {
 }
 
 void input() {
+    // What: main menu event loop of the CLI.
+    // Why: after login/startup, all user actions are routed from here.
+    // Example: option 1 goes to SQL parser, option 2 builds a WHERE clause manually.
     while (true) {
         int c = take_input_option();
-
         if (c == -1) {
             cin.clear();
             pause_screen(true);
@@ -240,21 +290,24 @@ void input() {
             print_banner();
             continue;
         }
-
         switch (c) {
             case 1:
+                // What: route user into full SQL-like query console.
+                // Why: this path supports parser-driven CREATE/INSERT/SELECT/JOIN/UPDATE/DELETE.
+                // Example: minidb> SELECT * FROM students WHERE id = 1;
                 print_section("Query Console");
                 query_console_loop();
                 pause_screen(false);
                 break;
 
             case 2: {
+                // What: legacy guided search flow that builds SELECT * WHERE manually.
+                // Why: useful for demos because it asks table, column, and value step by step.
+                // Example: table=students, column=id, value=1 becomes WHERE id = 1.
                 print_section("Search Inside Table");
-
                 string search_table_name;
                 cout << BOLD << "Enter table name: " << RESET;
                 cin >> search_table_name;
-
                 char tab_check[MAX_NAME];
                 strncpy(tab_check, search_table_name.c_str(), MAX_NAME - 1);
                 tab_check[MAX_NAME - 1] = '\0';
@@ -313,17 +366,26 @@ void input() {
             }
 
             case 3:
+                // What: show schema/catalog details for one table.
+                // Why: helps verify table structure before insert/search/debugging.
+                // Example: students metadata shows each column type and size.
                 print_section("Table Metadata");
                 display_meta_data();
                 pause_screen(true);
                 break;
 
             case 4:
+                // What: open built-in help screen.
+                // Why: users can check supported syntax while staying inside MiniDB.
+                // Example: confirms that BEGIN, COMMIT, and ROLLBACK are available.
                 help();
                 pause_screen(true);
                 break;
 
             case 5:
+                // What: exit the CLI process.
+                // Why: clean user-controlled shutdown path from the main menu.
+                // Example: choosing 5 prints goodbye and terminates the program.
                 print_section("Exit");
                 cout << GREEN << "MiniDB closed successfully.\n" << RESET;
                 cout << BOLD << CYAN << "\nGood bye!\n\n" << RESET;
@@ -341,8 +403,11 @@ void input() {
 }
 
 void start_system() {
-    AuthManager::init();
+    // What: initialize auth/storage directories, run recovery, then open the menu UI.
+    // Why: MiniDB must repair pending WAL changes before users run new queries.
+    // Example: after crash-after-WAL test, recover_all_tables() replays pending page writes.
     system_check();
+    AuthManager::init();
     RecoveryManager::recover_all_tables();
 
     clear_screen();
@@ -355,6 +420,9 @@ void start_system() {
 }
 
 string get_password() {
+    // What: read password without echoing characters to the terminal.
+    // Why: login should not show typed password on screen.
+    // Example: ./miniDB -u tester -p calls this before authenticate().
     struct termios termios_p;
 
     tcgetattr(STDIN_FILENO, &termios_p);
@@ -375,7 +443,77 @@ string get_password() {
     return pass;
 }
 
+string get_password_with_prompt(const string& prompt) {
+    struct termios termios_p;
+
+    tcgetattr(STDIN_FILENO, &termios_p);
+    termios_p.c_lflag &= ~ECHO;
+    tcsetattr(STDIN_FILENO, TCSANOW, &termios_p);
+
+    cout << prompt;
+
+    string pass;
+    cin >> pass;
+
+    termios_p.c_lflag |= ECHO;
+    tcsetattr(STDIN_FILENO, TCSANOW, &termios_p);
+
+    cout << "\n";
+
+    return pass;
+}
+
+bool create_user_interactively(const string& username, bool bootstrap_user) {
+    if (username.empty()) {
+        cout << RED << "Username cannot be empty.\n" << RESET;
+        return false;
+    }
+
+    if (AuthManager::user_exists(username)) {
+        cout << RED << "User already exists.\n" << RESET;
+        return false;
+    }
+
+    if (bootstrap_user) {
+        cout << YELLOW << "No users found in the system.\n" << RESET;
+        cout << BOLD << "Creating initial user: " << RESET << username << "\n";
+    } else {
+        cout << YELLOW << "User '" << username << "' does not exist.\n" << RESET;
+        cout << BOLD << "Creating new user: " << RESET << username << "\n";
+    }
+
+    while (true) {
+        string pass1 = get_password_with_prompt("Set password: ");
+        string pass2 = get_password_with_prompt("Confirm password: ");
+
+        if (pass1.empty()) {
+            cout << RED << "Password cannot be empty.\n" << RESET;
+            continue;
+        }
+
+        if (pass1 != pass2) {
+            cout << RED << "Passwords do not match. Try again.\n" << RESET;
+            continue;
+        }
+
+        if (!AuthManager::register_user(username, pass1)) {
+            cout << RED << "Failed to create user.\n" << RESET;
+            return false;
+        }
+
+        set_active_user(username);
+        ensure_default_database_for_active_user();
+        system_check();
+        cout << GREEN << "User created successfully!\n" << RESET;
+        return true;
+    }
+}
+
 int main(int argc, char *argv[]) {
+    // What: command-line entry point for MiniDB.
+    // Why: validates login arguments, creates first user if needed, then starts the DB monitor.
+    // Example: ./miniDB -u tester -p launches authenticated CLI mode.
+    system_check();
     AuthManager::init();
 
     if (argc == 4 || argc == 5) {
@@ -387,42 +525,38 @@ int main(int argc, char *argv[]) {
 
             // First run check
             if (!AuthManager::has_any_user()) {
-                cout << YELLOW << "No users found in the system.\n" << RESET;
-                cout << BOLD << "Creating initial user: " << RESET << username << "\n";
-                
-                string pass1, pass2;
-                while (true) {
-                    cout << "Set password: ";
-                    struct termios term;
-                    tcgetattr(STDIN_FILENO, &term);
-                    term.c_lflag &= ~ECHO;
-                    tcsetattr(STDIN_FILENO, TCSANOW, &term);
-                    cin >> pass1;
-                    term.c_lflag |= ECHO;
-                    tcsetattr(STDIN_FILENO, TCSANOW, &term);
-                    cout << "\nConfirm password: ";
-                    tcgetattr(STDIN_FILENO, &term);
-                    term.c_lflag &= ~ECHO;
-                    tcsetattr(STDIN_FILENO, TCSANOW, &term);
-                    cin >> pass2;
-                    term.c_lflag |= ECHO;
-                    tcsetattr(STDIN_FILENO, TCSANOW, &term);
-                    cout << "\n";
+                // What: create the first MiniDB user when auth storage is empty.
+                // Why: fresh installs need a bootstrap account before normal login can work.
+                // Example: first run with ./miniDB -u tester -p creates user "tester".
+                if (!create_user_interactively(username, true)) {
+                    return 0;
+                }
+            } else if (!AuthManager::user_exists(username)) {
+                cout << YELLOW << "User '" << username << "' was not found.\n" << RESET;
+                cout << "Create this user now? (y/n): ";
+                char choice = 'n';
+                cin >> choice;
 
-                    if (pass1 == pass2) {
-                        AuthManager::register_user(username, pass1);
-                        cout << GREEN << "User created successfully!\n" << RESET;
-                        break;
-                    } else {
-                        cout << RED << "Passwords do not match. Try again.\n" << RESET;
-                    }
+                if (tolower(static_cast<unsigned char>(choice)) != 'y') {
+                    cout << RED << "Authentication cancelled.\n" << RESET;
+                    return 0;
+                }
+
+                if (!create_user_interactively(username, false)) {
+                    return 0;
                 }
             } else {
+                // What: authenticate an existing user before opening the database monitor.
+                // Why: MiniDB should not expose tables until username/password are verified.
+                // Example: stored SHA-256 hash is compared with hash of typed password.
                 cout << BOLD << "User: " << RESET << username << "\n\n";
 
                 string password = get_password();
 
                 if (AuthManager::authenticate(username, password)) {
+                    set_active_user(username);
+                    ensure_default_database_for_active_user();
+                    system_check();
                     cout << GREEN << "Correct password!\n" << RESET;
                 } else {
                     cout << RED << "Incorrect password!\n" << RESET;

@@ -5,24 +5,98 @@
 #include "disk_manager.h"
 #include "display.h"
 #include "file_handler.h"
+#include "lock_manager.h"
 #include "recovery_manager.h"
 #include "storage_types.h"
+#include "transaction_manager.h"
 #include "tuple_serializer.h"
 #include "vacuum.h"
 
 #include <cstring>
 #include <iostream>
+#include <memory>
 #include <string>
 #include <vector>
 
 namespace {
 
+class ExclusiveRowLockGuard {
+  public:
+    ExclusiveRowLockGuard(const std::string& table_name, const RID& rid)
+        : table_name_(table_name), rid_(rid), locked_(false), transaction_lock_(false), ok_(true) {
+        if (rid_.page_id != INVALID_PAGE_ID && rid_.slot_id != INVALID_SLOT_ID) {
+            if (TransactionManager::in_transaction()) {
+                transaction_lock_ = true;
+                ok_ = LockManager::acquireExclusive(TransactionManager::current_txn_id(),
+                                                    table_name_, rid_);
+                if (!ok_) {
+                    TransactionManager::abort_current_due_to_lock(
+                        LockManager::abort_reason(TransactionManager::current_txn_id()));
+                }
+            } else {
+                LockManager::lock_row_exclusive(table_name_, rid_);
+                locked_ = true;
+            }
+        }
+    }
+
+    ~ExclusiveRowLockGuard() {
+        if (locked_ && !transaction_lock_) {
+            LockManager::unlock_row_exclusive(table_name_, rid_);
+        }
+    }
+
+    bool ok() const { return ok_; }
+
+  private:
+    std::string table_name_;
+    RID rid_;
+    bool locked_;
+    bool transaction_lock_;
+    bool ok_;
+};
+
+class ExclusivePageLockGuard {
+  public:
+    ExclusivePageLockGuard(const std::string& table_name, uint32_t page_id)
+        : table_name_(table_name), page_id_(page_id), locked_(false) {
+        if (page_id_ != INVALID_PAGE_ID) {
+            LockManager::lock_page_exclusive(table_name_, page_id_);
+            locked_ = true;
+        }
+    }
+
+    ~ExclusivePageLockGuard() {
+        unlock();
+    }
+
+    void unlock() {
+        if (locked_) {
+            LockManager::unlock_page_exclusive(table_name_, page_id_);
+            locked_ = false;
+        }
+    }
+
+  private:
+    std::string table_name_;
+    uint32_t page_id_;
+    bool locked_;
+};
+
 RID insert_relocated_tuple(DiskManager& disk,
                            const std::string& tab_name,
                            int primary_key,
                            const std::vector<char>& new_bytes,
-                           std::vector<RecoveryTicket>& recovery_tickets) {
+                           std::vector<RecoveryTicket>& recovery_tickets,
+                           uint32_t already_locked_page_id = INVALID_PAGE_ID) {
+    // What: place an updated tuple somewhere else when it no longer fits in its old slot.
+    // Why: VARCHAR updates can become larger, so overwriting the old byte range may corrupt nearby rows.
+    // Example: name "A" updated to "Aryan Saini" may need a new RID and index update.
     for (uint32_t pid = 0; pid < disk.page_count(); ++pid) {
+        std::unique_ptr<ExclusivePageLockGuard> page_lock;
+        if (pid != already_locked_page_id) {
+            page_lock.reset(new ExclusivePageLockGuard(tab_name, pid));
+        }
         char pg[STORAGE_PAGE_SIZE];
         if (!disk.read_page(pid, pg)) continue;
 
@@ -73,6 +147,10 @@ RID insert_relocated_tuple(DiskManager& disk,
         return RID();
     }
 
+    std::unique_ptr<ExclusivePageLockGuard> page_lock;
+    if (new_pid != already_locked_page_id) {
+        page_lock.reset(new ExclusivePageLockGuard(tab_name, new_pid));
+    }
     DataPage dp;
     dp.initialize(new_pid);
 
@@ -101,7 +179,17 @@ bool apply_update_at_rid(const std::string& tab_name,
                          const RID& rid,
                          int set_col_idx,
                          const std::string& new_val_str) {
-    std::string data_path = "table/" + tab_name + "/data.dat";
+    // What: update one row already located by RID.
+    // Why: both B+ Tree lookup and scan paths eventually need the same "modify tuple bytes" logic.
+    // Example: RID(0, 2) is read, deserialized, changed, serialized, WAL-logged, and written back.
+    ExclusivePageLockGuard page_lock(tab_name, rid.page_id);
+    ExclusiveRowLockGuard row_lock(tab_name, rid);
+    if (!row_lock.ok()) {
+        std::cout << TransactionManager::last_error() << "\n";
+        return false;
+    }
+
+    std::string data_path = table_data_path(tab_name).string();
     DiskManager disk(data_path);
     if (!disk.open_or_create()) {
         std::cout << "Error: Cannot open data file.\n";
@@ -184,11 +272,13 @@ bool apply_update_at_rid(const std::string& tab_name,
     if (!disk.write_page(rid.page_id, buf)) {
         return false;
     }
+    page_lock.unlock();
 
     std::vector<RecoveryTicket> recovery_tickets;
     recovery_tickets.push_back(dead_slot_ticket);
 
-    RID new_rid = insert_relocated_tuple(disk, tab_name, pk_value, new_bytes, recovery_tickets);
+    RID new_rid = insert_relocated_tuple(disk, tab_name, pk_value, new_bytes,
+                                         recovery_tickets);
     if (new_rid.page_id == INVALID_PAGE_ID) {
         std::cout << "Error: Could not relocate updated tuple.\n";
         return false;
@@ -210,6 +300,9 @@ int update_via_bptree(const std::string& tab_name,
                       const std::vector<ColumnSchema>& schema,
                       const UpdateStatement& stmt,
                       int set_col_idx) {
+    // What: update one row by primary-key lookup through B+ Tree.
+    // Why: primary-key WHERE gives a direct RID, so update can avoid scanning all table pages.
+    // Example: UPDATE students SET dept = ECE WHERE id = 1;
     int pk_value;
     try {
         size_t used = 0;
@@ -241,7 +334,10 @@ int update_via_linear_scan(const std::string& tab_name,
                            const UpdateStatement& stmt,
                            int set_col_idx,
                            int where_col_idx) {
-    std::string data_path = "table/" + tab_name + "/data.dat";
+    // What: update every row whose non-indexed WHERE column matches.
+    // Why: without a secondary index, the only correct path is checking each tuple.
+    // Example: UPDATE students SET dept = ECE WHERE name = Aryan;
+    std::string data_path = table_data_path(tab_name).string();
     DiskManager disk(data_path);
     if (!disk.open_or_create()) {
         std::cout << "Error: Cannot open data file.\n";
@@ -258,12 +354,15 @@ int update_via_linear_scan(const std::string& tab_name,
     std::vector<RecoveryTicket> page_tickets;
 
     for (uint32_t page_id = 0; page_id < disk.page_count(); ++page_id) {
+        ExclusivePageLockGuard page_lock(tab_name, page_id);
         char buf[STORAGE_PAGE_SIZE];
         if (!disk.read_page(page_id, buf)) continue;
 
         DataPage dp;
         dp.load_from_buffer(buf, STORAGE_PAGE_SIZE);
         bool page_dirty = false;
+        std::vector<std::unique_ptr<ExclusiveRowLockGuard>> row_locks;
+        bool lock_failed = false;
 
         for (uint16_t slot_id = 0; slot_id < dp.slot_count(); ++slot_id) {
             std::vector<char> old_bytes;
@@ -285,6 +384,13 @@ int update_via_linear_scan(const std::string& tab_name,
             }
 
             if (!matches) continue;
+
+            RID current_rid(page_id, slot_id);
+            row_locks.emplace_back(new ExclusiveRowLockGuard(tab_name, current_rid));
+            if (!row_locks.back()->ok()) {
+                lock_failed = true;
+                break;
+            }
 
             const ColumnSchema& col = schema[set_col_idx];
             if (col.type == STORAGE_COLUMN_INT) {
@@ -326,14 +432,16 @@ int update_via_linear_scan(const std::string& tab_name,
             }
         }
 
+        if (lock_failed) {
+            return 0;
+        }
+
         if (page_dirty) {
             RecoveryTicket ticket =
                 RecoveryManager::log_page_redo(tab_name, page_id, 0, 0, buf, false);
             if (!ticket.valid) {
                 std::cout << "Error: Could not write recovery log for updated page " << page_id << ".\n";
-                continue;
-            }
-            if (disk.write_page(page_id, buf)) {
+            } else if (disk.write_page(page_id, buf)) {
                 page_tickets.push_back(ticket);
             }
         }
@@ -374,6 +482,9 @@ int update_via_linear_scan(const std::string& tab_name,
 }  // namespace
 
 void execute_update(const UpdateStatement& stmt) {
+    // What: validate UPDATE command and route it to indexed or scan-based execution.
+    // Why: the parser gives a structured UpdateStatement; this layer checks schema and storage rules.
+    // Example: primary key cannot be updated because B+ Tree keys must stay stable.
     char tab[MAX_NAME];
     strncpy(tab, stmt.table_name.c_str(), MAX_NAME - 1);
     tab[MAX_NAME - 1] = '\0';

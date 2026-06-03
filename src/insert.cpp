@@ -4,7 +4,9 @@
 #include "buffer_pool_manager.h"
 #include "disk_manager.h"
 #include "data_page.h"
+#include "lock_manager.h"
 #include "recovery_manager.h"
+#include "transaction_manager.h"
 #include "tuple_serializer.h"
 #include "vacuum.h"
 #include <string>
@@ -14,6 +16,44 @@
 #include <limits>
 
 // Removed local search_table definition as it is now in display.h/display.cpp
+
+namespace {
+
+class InsertRowLockGuard {
+  public:
+    InsertRowLockGuard(const std::string& table_name, const RID& rid)
+        : table_name_(table_name), rid_(rid), locked_(false), transaction_lock_(false), ok_(true) {
+        if (TransactionManager::in_transaction()) {
+            transaction_lock_ = true;
+            ok_ = LockManager::acquireExclusive(TransactionManager::current_txn_id(),
+                                                table_name_, rid_);
+            if (!ok_) {
+                TransactionManager::abort_current_due_to_lock(
+                    LockManager::abort_reason(TransactionManager::current_txn_id()));
+            }
+        } else {
+            LockManager::lock_row_exclusive(table_name_, rid_);
+            locked_ = true;
+        }
+    }
+
+    ~InsertRowLockGuard() {
+        if (locked_ && !transaction_lock_) {
+            LockManager::unlock_row_exclusive(table_name_, rid_);
+        }
+    }
+
+    bool ok() const { return ok_; }
+
+  private:
+    std::string table_name_;
+    RID rid_;
+    bool locked_;
+    bool transaction_lock_;
+    bool ok_;
+};
+
+}  // namespace
 
 /*
  * What:
@@ -62,16 +102,14 @@ void insert_command(char tname[], const std::vector<TupleValue>& values, const s
     }
 
     // 2. Serialize the data into a tuple
-    std::vector<char> tuple_data;
+    vector<char> tuple_data;
     if (!TupleSerializer::serialize(schema, values, tuple_data)) {
         std::cout << "Error: Failed to serialize tuple." << std::endl;
         return;
     }
 
     // 3. Manage the Data Storage (Page-Based)
-    std::string data_path = "table/";
-    data_path += tname;
-    data_path += "/data.dat";
+    std::string data_path = table_data_path(tname).string();
     
     DiskManager data_disk(data_path, STORAGE_PAGE_SIZE);
     if (!data_disk.open_or_create()) {
@@ -135,6 +173,14 @@ void insert_command(char tname[], const std::vector<TupleValue>& values, const s
         return;
     }
 
+    RID rid(target_page_id, slot_id);
+    InsertRowLockGuard inserted_row_lock(tname, rid);
+    if (!inserted_row_lock.ok()) {
+        std::cout << TransactionManager::last_error() << std::endl;
+        buffer_pool.unpin_page(target_page_id, false);
+        return;
+    }
+
     RecoveryTicket recovery_ticket =
         RecoveryManager::log_insert_redo(tname, target_page_id, slot_id, pk_value, page.data());
     if (!recovery_ticket.valid) {
@@ -148,7 +194,6 @@ void insert_command(char tname[], const std::vector<TupleValue>& values, const s
     buffer_pool.flush_page(target_page_id);
 
     // 6. Update the B+ Tree Index with the new RID
-    RID rid(target_page_id, slot_id);
     index.insert(pk_value, rid);
     RecoveryManager::mark_insert_applied(recovery_ticket);
 
@@ -161,9 +206,7 @@ void bulk_insert_command(char tname[], const std::vector<std::vector<TupleValue>
     BPtree index(tname);
     
     // 2. Manage the Data Storage (Page-Based)
-    std::string data_path = "table/";
-    data_path += tname;
-    data_path += "/data.dat";
+    std::string data_path = table_data_path(tname).string();
     
     DiskManager data_disk(data_path, STORAGE_PAGE_SIZE);
     if (!data_disk.open_or_create()) {
@@ -260,11 +303,17 @@ void bulk_insert_command(char tname[], const std::vector<std::vector<TupleValue>
             continue;
         }
 
+        RID rid(current_page_id, slot_id);
+        InsertRowLockGuard inserted_row_lock(tname, rid);
+        if (!inserted_row_lock.ok()) {
+            std::cout << TransactionManager::last_error() << std::endl;
+            continue;
+        }
+
         std::memcpy(current_buffer, current_page.data(), STORAGE_PAGE_SIZE);
         // We keep the page pinned for the next iteration
 
         // 6. Update the B+ Tree Index with the new RID
-        RID rid(current_page_id, slot_id);
         index.insert(pk_value, rid);
 
         std::cout << "Successfully inserted row into " << tname << " at RID(" 

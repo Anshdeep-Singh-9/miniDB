@@ -7,6 +7,9 @@
 namespace {
 template <typename T>
 void append_value(std::vector<char>& out, const T& value) {
+    // What: append the in-memory bytes of a fixed-size value into tuple output.
+    // Why: INT values are stored directly as 4 bytes inside the serialized tuple.
+    // Example: integer 10 is copied as sizeof(int32_t) bytes.
     const char* start = reinterpret_cast<const char*>(&value);
     out.insert(out.end(), start, start + sizeof(T));
 }
@@ -41,6 +44,9 @@ TupleValue TupleValue::FromVarchar(const std::string& value) {
 bool TupleSerializer::serialize(const std::vector<ColumnSchema>& schema,
                                 const std::vector<TupleValue>& values,
                                 std::vector<char>& tuple_out) {
+    // What: convert logical row values into compact bytes for page storage.
+    // Why: DiskManager/DataPage can store only bytes, not C++ strings and objects directly.
+    // Example: (1, "Aryan") becomes [4-byte int][2-byte string length]["Aryan" bytes].
     tuple_out.clear();
 
     if (schema.size() != values.size()) {
@@ -89,6 +95,9 @@ bool TupleSerializer::serialize(const std::vector<ColumnSchema>& schema,
 bool TupleSerializer::deserialize(const std::vector<ColumnSchema>& schema,
                                   const std::vector<char>& tuple_bytes,
                                   std::vector<TupleValue>& values_out) {
+    // What: convert stored tuple bytes back into typed row values.
+    // Why: SELECT/WHERE/UPDATE need readable INT/VARCHAR values after fetching a page.
+    // Example: [4-byte int][length=5]["Aryan"] becomes id=1 and name="Aryan".
     values_out.clear();
 
     std::size_t offset = 0;
@@ -135,6 +144,9 @@ bool TupleSerializer::deserialize(const std::vector<ColumnSchema>& schema,
 }
 
 void TupleSerializer::print_tuple (const std::vector<TupleValue>& values){
+    // What: print deserialized tuple values for debugging/display paths.
+    // Why: once bytes become TupleValue objects, they can be shown as normal table cells.
+    // Example: values [1, "CSE"] are printed as columns in the terminal.
     int n= values.size();
     // cout<<"Called!\n";
     for(int i=0; i<n; i++){
@@ -145,6 +157,6 @@ void TupleSerializer::print_tuple (const std::vector<TupleValue>& values){
             std::cout<<values[i].string_value<<"\t\t";
         }
     }
-
+    
     std::cout<<std::endl;
 }

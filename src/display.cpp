@@ -6,8 +6,11 @@
 #include "tuple_serializer.h"
 #include "where.h"
 
+#include <algorithm>
+#include <cctype>
 #include <iomanip>
 #include <iostream>
+#include <unordered_map>
 #include <vector>
 #include <string>
 #include <cstring>
@@ -17,8 +20,407 @@
 #define BLUE    "\033[34m"
 #define WHITE   "\033[97m"
 #define GREEN   "\033[32m"
+
+namespace {
+
+struct SelectModifiers {
+    bool has_order_by = false;
+    std::string order_by_column;
+    bool order_desc = false;
+    int limit = -1;
+};
+
+struct AggregateExpr {
+    std::string func;
+    std::string column;
+    std::string label;
+};
+
+struct SelectItem {
+    bool is_aggregate = false;
+    std::string func;
+    std::string column;
+    std::string label;
+};
+
+std::string to_lower_copy(std::string s) {
+    for (std::size_t i = 0; i < s.size(); ++i) {
+        s[i] = static_cast<char>(std::tolower(static_cast<unsigned char>(s[i])));
+    }
+    return s;
+}
+
+bool tuple_less(const TupleValue& a, const TupleValue& b) {
+    if (a.type == STORAGE_COLUMN_INT && b.type == STORAGE_COLUMN_INT) {
+        return a.int_value < b.int_value;
+    }
+    if (a.type == STORAGE_COLUMN_VARCHAR && b.type == STORAGE_COLUMN_VARCHAR) {
+        return a.string_value < b.string_value;
+    }
+    if (a.type == STORAGE_COLUMN_INT && b.type == STORAGE_COLUMN_VARCHAR) {
+        return std::to_string(a.int_value) < b.string_value;
+    }
+    return a.string_value < std::to_string(b.int_value);
+}
+
+bool parse_aggregate_expr(const std::string& token, AggregateExpr& expr) {
+    std::string lower = to_lower_copy(token);
+    const char* funcs[] = {"count", "sum", "avg", "min", "max"};
+    for (std::size_t i = 0; i < 5; ++i) {
+        const std::string prefix = std::string(funcs[i]) + "(";
+        if (lower.size() > prefix.size() + 1 &&
+            lower.compare(0, prefix.size(), prefix) == 0 &&
+            lower[lower.size() - 1] == ')') {
+            expr.func = funcs[i];
+            expr.column = token.substr(prefix.size(), token.size() - prefix.size() - 1);
+            expr.label = token;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool is_aggregate_select(const std::vector<std::string>& target_cols,
+                         std::vector<AggregateExpr>& aggregates) {
+    aggregates.clear();
+    if (target_cols.empty()) return false;
+
+    for (std::size_t i = 0; i < target_cols.size(); ++i) {
+        AggregateExpr expr;
+        if (!parse_aggregate_expr(target_cols[i], expr)) {
+            return false;
+        }
+        aggregates.push_back(expr);
+    }
+    return !aggregates.empty();
+}
+
+bool parse_select_items(const std::vector<std::string>& target_cols,
+                        std::vector<SelectItem>& items,
+                        bool& has_aggregate,
+                        bool& has_plain_column) {
+    items.clear();
+    has_aggregate = false;
+    has_plain_column = false;
+
+    for (std::size_t i = 0; i < target_cols.size(); ++i) {
+        AggregateExpr agg;
+        SelectItem item;
+        if (parse_aggregate_expr(target_cols[i], agg)) {
+            item.is_aggregate = true;
+            item.func = agg.func;
+            item.column = agg.column;
+            item.label = agg.label;
+            has_aggregate = true;
+        } else {
+            item.is_aggregate = false;
+            item.column = target_cols[i];
+            item.label = target_cols[i];
+            has_plain_column = true;
+        }
+        items.push_back(item);
+    }
+    return !items.empty();
+}
+
+int find_schema_column(const std::vector<ColumnSchema>& schema, const std::string& col_name) {
+    for (std::size_t i = 0; i < schema.size(); ++i) {
+        if (schema[i].name == col_name) return static_cast<int>(i);
+    }
+    return -1;
+}
+
+bool apply_order_by_and_limit(QueryResult& result,
+                              const SelectModifiers& modifiers,
+                              const std::vector<AggregateExpr>& aggregates) {
+    if (!aggregates.empty()) {
+        if (modifiers.limit >= 0 &&
+            static_cast<int>(result.rows.size()) > modifiers.limit) {
+            result.rows.resize(modifiers.limit);
+        }
+        return true;
+    }
+
+    if (modifiers.has_order_by) {
+        int order_idx = find_schema_column(result.schema, modifiers.order_by_column);
+        if (order_idx >= 0) {
+            std::sort(result.rows.begin(), result.rows.end(),
+                      [order_idx, &modifiers](const std::vector<TupleValue>& a,
+                                              const std::vector<TupleValue>& b) {
+                          bool less = tuple_less(a[order_idx], b[order_idx]);
+                          bool greater = tuple_less(b[order_idx], a[order_idx]);
+                          if (modifiers.order_desc) {
+                              return greater;
+                          }
+                          return less;
+                      });
+        } else {
+            int source_order_idx = find_schema_column(result.source_schema, modifiers.order_by_column);
+            if (source_order_idx < 0 ||
+                result.source_rows.size() != result.rows.size()) {
+                return false;
+            }
+
+            std::vector<std::size_t> order(result.rows.size(), 0);
+            for (std::size_t i = 0; i < order.size(); ++i) {
+                order[i] = i;
+            }
+
+            std::sort(order.begin(), order.end(),
+                      [&result, source_order_idx, &modifiers](std::size_t a, std::size_t b) {
+                          bool less = tuple_less(result.source_rows[a][source_order_idx],
+                                                 result.source_rows[b][source_order_idx]);
+                          bool greater = tuple_less(result.source_rows[b][source_order_idx],
+                                                    result.source_rows[a][source_order_idx]);
+                          if (modifiers.order_desc) {
+                              return greater;
+                          }
+                          return less;
+                      });
+
+            std::vector<std::vector<TupleValue>> sorted_rows;
+            std::vector<std::vector<TupleValue>> sorted_source_rows;
+            sorted_rows.reserve(result.rows.size());
+            sorted_source_rows.reserve(result.source_rows.size());
+            for (std::size_t i = 0; i < order.size(); ++i) {
+                sorted_rows.push_back(result.rows[order[i]]);
+                sorted_source_rows.push_back(result.source_rows[order[i]]);
+            }
+            result.rows.swap(sorted_rows);
+            result.source_rows.swap(sorted_source_rows);
+        }
+    }
+
+    if (modifiers.limit >= 0 &&
+        static_cast<int>(result.rows.size()) > modifiers.limit) {
+        result.rows.resize(modifiers.limit);
+    }
+
+    return true;
+}
+
+std::string group_key_for_value(const TupleValue& value) {
+    if (value.type == STORAGE_COLUMN_INT) {
+        return "I:" + std::to_string(value.int_value);
+    }
+    return "S:" + value.string_value;
+}
+
+bool apply_group_by(QueryResult& result,
+                    const std::vector<SelectItem>& items,
+                    const std::string& group_by_column) {
+    if (group_by_column.empty()) return true;
+    if (result.source_schema.empty()) return false;
+
+    int group_idx = find_schema_column(result.source_schema, group_by_column);
+    if (group_idx < 0) return false;
+
+    bool seen_group_column = false;
+    for (std::size_t i = 0; i < items.size(); ++i) {
+        if (!items[i].is_aggregate && items[i].column == group_by_column) {
+            seen_group_column = true;
+        } else if (!items[i].is_aggregate) {
+            return false;
+        }
+    }
+    if (!seen_group_column) return false;
+
+    struct GroupBucket {
+        TupleValue group_value;
+        std::vector<std::vector<TupleValue>> rows;
+    };
+
+    std::vector<GroupBucket> buckets;
+    std::unordered_map<std::string, std::size_t> bucket_index;
+    for (std::size_t r = 0; r < result.source_rows.size(); ++r) {
+        const TupleValue& key_value = result.source_rows[r][group_idx];
+        const std::string key = group_key_for_value(key_value);
+        std::unordered_map<std::string, std::size_t>::iterator found = bucket_index.find(key);
+        if (found == bucket_index.end()) {
+            GroupBucket bucket;
+            bucket.group_value = key_value;
+            bucket.rows.push_back(result.source_rows[r]);
+            bucket_index[key] = buckets.size();
+            buckets.push_back(bucket);
+        } else {
+            buckets[found->second].rows.push_back(result.source_rows[r]);
+        }
+    }
+
+    std::vector<ColumnSchema> grouped_schema;
+    std::vector<std::vector<TupleValue>> grouped_rows;
+
+    for (std::size_t i = 0; i < items.size(); ++i) {
+        if (!items[i].is_aggregate) {
+            grouped_schema.push_back(result.source_schema[group_idx]);
+            grouped_schema.back().name = items[i].label;
+        } else {
+            const std::string lower_func = to_lower_copy(items[i].func);
+            if (lower_func == "count") {
+                grouped_schema.push_back(ColumnSchema(items[i].label, STORAGE_COLUMN_INT, sizeof(int32_t)));
+            } else {
+                int agg_idx = find_schema_column(result.source_schema, items[i].column);
+                if (agg_idx < 0) return false;
+                grouped_schema.push_back(result.source_schema[agg_idx]);
+                grouped_schema.back().name = items[i].label;
+            }
+        }
+    }
+
+    for (std::size_t b = 0; b < buckets.size(); ++b) {
+        std::vector<TupleValue> out_row;
+        for (std::size_t i = 0; i < items.size(); ++i) {
+            if (!items[i].is_aggregate) {
+                out_row.push_back(buckets[b].group_value);
+                continue;
+            }
+
+            const std::string lower_func = to_lower_copy(items[i].func);
+            if (lower_func == "count") {
+                out_row.push_back(TupleValue::FromInt(static_cast<int32_t>(buckets[b].rows.size())));
+                continue;
+            }
+
+            int agg_idx = find_schema_column(result.source_schema, items[i].column);
+            if (agg_idx < 0) return false;
+            const ColumnSchema& src_col = result.source_schema[agg_idx];
+
+            if (lower_func == "sum" || lower_func == "avg") {
+                if (src_col.type != STORAGE_COLUMN_INT) return false;
+                long long total = 0;
+                for (std::size_t r = 0; r < buckets[b].rows.size(); ++r) {
+                    total += buckets[b].rows[r][agg_idx].int_value;
+                }
+                int32_t value = (lower_func == "avg")
+                                    ? static_cast<int32_t>(total / static_cast<long long>(buckets[b].rows.size()))
+                                    : static_cast<int32_t>(total);
+                out_row.push_back(TupleValue::FromInt(value));
+            } else if (src_col.type == STORAGE_COLUMN_INT) {
+                int32_t best = buckets[b].rows[0][agg_idx].int_value;
+                for (std::size_t r = 1; r < buckets[b].rows.size(); ++r) {
+                    int32_t cur = buckets[b].rows[r][agg_idx].int_value;
+                    if ((lower_func == "min" && cur < best) ||
+                        (lower_func == "max" && cur > best)) {
+                        best = cur;
+                    }
+                }
+                out_row.push_back(TupleValue::FromInt(best));
+            } else {
+                std::string best = buckets[b].rows[0][agg_idx].string_value;
+                for (std::size_t r = 1; r < buckets[b].rows.size(); ++r) {
+                    const std::string& cur = buckets[b].rows[r][agg_idx].string_value;
+                    if ((lower_func == "min" && cur < best) ||
+                        (lower_func == "max" && cur > best)) {
+                        best = cur;
+                    }
+                }
+                out_row.push_back(TupleValue::FromVarchar(best));
+            }
+        }
+        grouped_rows.push_back(out_row);
+    }
+
+    result.schema = grouped_schema;
+    result.rows = grouped_rows;
+    result.source_schema = grouped_schema;
+    result.source_rows = grouped_rows;
+    return true;
+}
+
+bool apply_aggregates(QueryResult& result,
+                      const std::vector<AggregateExpr>& aggregates) {
+    if (aggregates.empty()) return true;
+
+    std::vector<ColumnSchema> agg_schema;
+    std::vector<TupleValue> agg_row;
+
+    for (std::size_t i = 0; i < aggregates.size(); ++i) {
+        const AggregateExpr& expr = aggregates[i];
+        const std::string lower_func = to_lower_copy(expr.func);
+
+        if (lower_func == "count") {
+            if (expr.column != "*") {
+                return false;
+            }
+            agg_schema.push_back(ColumnSchema(expr.label, STORAGE_COLUMN_INT, sizeof(int32_t)));
+            agg_row.push_back(TupleValue::FromInt(static_cast<int32_t>(result.rows.size())));
+            continue;
+        }
+
+        int col_idx = find_schema_column(result.schema, expr.column);
+        if (col_idx < 0) {
+            return false;
+        }
+
+        const ColumnSchema& src_col = result.schema[col_idx];
+        if (src_col.type != STORAGE_COLUMN_INT && lower_func != "min" && lower_func != "max") {
+            return false;
+        }
+
+        if (result.rows.empty()) {
+            if (lower_func == "sum" || lower_func == "avg" || lower_func == "count") {
+                agg_schema.push_back(ColumnSchema(expr.label, STORAGE_COLUMN_INT, sizeof(int32_t)));
+                agg_row.push_back(TupleValue::FromInt(0));
+            } else if (src_col.type == STORAGE_COLUMN_INT) {
+                agg_schema.push_back(ColumnSchema(expr.label, STORAGE_COLUMN_INT, sizeof(int32_t)));
+                agg_row.push_back(TupleValue::FromInt(0));
+            } else {
+                agg_schema.push_back(ColumnSchema(expr.label, STORAGE_COLUMN_VARCHAR, src_col.max_length));
+                agg_row.push_back(TupleValue::FromVarchar(""));
+            }
+            continue;
+        }
+
+        if (lower_func == "sum" || lower_func == "avg") {
+            long long total = 0;
+            for (std::size_t r = 0; r < result.rows.size(); ++r) {
+                total += result.rows[r][col_idx].int_value;
+            }
+            int32_t value = (lower_func == "avg")
+                                ? static_cast<int32_t>(total / static_cast<long long>(result.rows.size()))
+                                : static_cast<int32_t>(total);
+            agg_schema.push_back(ColumnSchema(expr.label, STORAGE_COLUMN_INT, sizeof(int32_t)));
+            agg_row.push_back(TupleValue::FromInt(value));
+            continue;
+        }
+
+        if (src_col.type == STORAGE_COLUMN_INT) {
+            int32_t best = result.rows[0][col_idx].int_value;
+            for (std::size_t r = 1; r < result.rows.size(); ++r) {
+                int32_t cur = result.rows[r][col_idx].int_value;
+                if ((lower_func == "min" && cur < best) ||
+                    (lower_func == "max" && cur > best)) {
+                    best = cur;
+                }
+            }
+            agg_schema.push_back(ColumnSchema(expr.label, STORAGE_COLUMN_INT, sizeof(int32_t)));
+            agg_row.push_back(TupleValue::FromInt(best));
+        } else {
+            std::string best = result.rows[0][col_idx].string_value;
+            for (std::size_t r = 1; r < result.rows.size(); ++r) {
+                const std::string& cur = result.rows[r][col_idx].string_value;
+                if ((lower_func == "min" && cur < best) ||
+                    (lower_func == "max" && cur > best)) {
+                    best = cur;
+                }
+            }
+            agg_schema.push_back(ColumnSchema(expr.label, STORAGE_COLUMN_VARCHAR, src_col.max_length));
+            agg_row.push_back(TupleValue::FromVarchar(best));
+        }
+    }
+
+    result.schema = agg_schema;
+    result.rows.clear();
+    result.rows.push_back(agg_row);
+    return true;
+}
+
+}  // namespace
 void print_table(const std::vector<ColumnSchema>& schema,
                  const std::vector<std::vector<TupleValue>>& table_data) {
+    // What: render rows and columns as a readable terminal table.
+    // Why: execution returns TupleValue objects, but users need a clean CLI output.
+    // Example: SELECT name, dept FROM students; prints selected columns with aligned widths.
     if (schema.empty()) {
         std::cout << "\n(No columns to display)\n";
         return;
@@ -124,21 +526,20 @@ void print_table(const std::vector<ColumnSchema>& schema,
 }
 
 int search_table(char tab_name[]) {
-    char str[MAX_NAME + 1];
-    strcpy(str, "grep -Fxq ");
-    strcat(str, tab_name);
-    strcat(str, " ./table/table_list");
-
-    int x = system(str);
-
-    if (x == 0) {
-        return 1;
+    std::ifstream in(table_list_path());
+    std::string name;
+    while (in >> name) {
+        if (name == tab_name) {
+            return 1;
+        }
     }
-
     return 0;
 }
 
 static bool build_schema_from_meta(table* meta, std::vector<ColumnSchema>& schema) {
+    // What: convert old table metadata into the storage-layer schema format.
+    // Why: TupleSerializer uses ColumnSchema, while catalog files store columns in table structs.
+    // Example: metadata column INT becomes STORAGE_COLUMN_INT for serialization/deserialization.
     if (meta == NULL) {
         return false;
     }
@@ -161,9 +562,12 @@ static bool build_schema_from_meta(table* meta, std::vector<ColumnSchema>& schem
 static bool load_all_rows_using_buffer_pool(const std::string& tab_name,
                                             const std::vector<ColumnSchema>& full_schema,
                                             std::vector<std::vector<TupleValue>>& rows) {
+    // What: read every page through BufferPoolManager and deserialize every live tuple.
+    // Why: SELECT without WHERE and JOIN need complete table rows from page storage.
+    // Example: SELECT * FROM students; fetches page frames, reads slots, and builds row objects.
     rows.clear();
 
-    std::string data_path = "table/" + tab_name + "/data.dat";
+    std::string data_path = table_data_path(tab_name).string();
 
     DiskManager data_disk(data_path);
     if (!data_disk.open_or_create()) {
@@ -249,6 +653,9 @@ static bool execute_select_join_nested(const std::vector<std::string>& target_co
                                        const std::string& where_column,
                                        const std::string& where_value,
                                        QueryResult* res) {
+    // What: execute INNER/LEFT JOIN using nested loops over both table row sets.
+    // Why: MiniDB has no join optimizer yet, so nested loop is the simplest correct join algorithm.
+    // Example: SELECT s.name, d.hod FROM students JOIN departments ON students.dept = departments.code;
     char left_tab[MAX_NAME];
     char right_tab[MAX_NAME];
     strncpy(left_tab, left_table.c_str(), MAX_NAME - 1);
@@ -492,7 +899,9 @@ static bool execute_select_join_nested(const std::vector<std::string>& target_co
         res->strategy = "Nested Loop Join";
     }
 
-    print_table(output_schema, output_rows);
+    if (res == nullptr) {
+        print_table(output_schema, output_rows);
+    }
 
     delete left_meta;
     delete right_meta;
@@ -500,6 +909,9 @@ static bool execute_select_join_nested(const std::vector<std::string>& target_co
 }
 
 void display() {
+    // What: interactive menu path for displaying a full table.
+    // Why: the older menu still needs to reuse the newer page + serializer storage path.
+    // Example: menu option "display table contents" asks table name and prints all rows.
     char tab[MAX_NAME];
 
     std::cout << "Enter table name: ";
@@ -529,6 +941,9 @@ void display() {
 }
 
 void show_tables() {
+    // What: list table names from the central table catalog file.
+    // Why: MiniDB stores table existence separately from each table's data pages.
+    // Example: SHOW TABLES; reads table/table_list and prints all names.
     char name[MAX_NAME];
 
     std::vector<ColumnSchema> schema;
@@ -536,7 +951,7 @@ void show_tables() {
 
     std::vector<std::vector<TupleValue>> rows;
 
-    FilePtr fp = fopen("./table/table_list", "r");
+    FilePtr fp = fopen(table_list_path().string().c_str(), "r");
 
     if (fp) {
         while (fscanf(fp, "%s", name) != EOF) {
@@ -553,6 +968,9 @@ void show_tables() {
 }
 
 void display_meta_data() {
+    // What: show schema metadata for one table.
+    // Why: users and developers can verify column names, types, and sizes before running queries.
+    // Example: metadata for students shows id INT, name VARCHAR, dept VARCHAR.
     std::string name;
 
     std::cout << "Enter the name of table: ";
@@ -601,6 +1019,9 @@ void display_meta_data() {
 
 void execute_select(const std::string& tab_name,
                     const std::vector<std::string>& target_cols, QueryResult* res) {
+    // What: execute SELECT without WHERE by loading all rows and projecting requested columns.
+    // Why: this is the base read path for full table reads before filtering or indexing is needed.
+    // Example: SELECT name, dept FROM students;
     char tab[MAX_NAME];
     strncpy(tab, tab_name.c_str(), MAX_NAME - 1);
     tab[MAX_NAME - 1] = '\0';
@@ -624,10 +1045,66 @@ void execute_select(const std::string& tab_name,
         return;
     }
 
+    std::vector<SelectItem> select_items;
+    bool has_aggregate = false;
+    bool has_plain_column = false;
+    parse_select_items(target_cols, select_items, has_aggregate, has_plain_column);
+    bool aggregate_query = has_aggregate;
     bool select_all = (target_cols.size() == 1 && target_cols[0] == "*");
     std::vector<int> selected_indices;
 
-    if (select_all) {
+    if (aggregate_query) {
+        for (std::size_t i = 0; i < select_items.size(); ++i) {
+            if (!select_items[i].is_aggregate || select_items[i].column == "*") {
+                continue;
+            }
+            bool found = false;
+            for (int c = 0; c < meta->count; ++c) {
+                if (select_items[i].column == meta->col[c].col_name) {
+                    if (std::find(selected_indices.begin(), selected_indices.end(), c) ==
+                        selected_indices.end()) {
+                        selected_indices.push_back(c);
+                    }
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                if (res) {
+                    res->success = false;
+                    res->message = "Error: Column '" + select_items[i].column + "' does not exist in table.";
+                }
+                std::cout << "Error: Column '" << select_items[i].column
+                          << "' does not exist in table.\n";
+                delete meta;
+                return;
+            }
+        }
+        for (std::size_t i = 0; i < select_items.size(); ++i) {
+            if (select_items[i].is_aggregate || select_items[i].column == "*") continue;
+            bool found = false;
+            for (int c = 0; c < meta->count; ++c) {
+                if (select_items[i].column == meta->col[c].col_name) {
+                    if (std::find(selected_indices.begin(), selected_indices.end(), c) ==
+                        selected_indices.end()) {
+                        selected_indices.push_back(c);
+                    }
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                if (res) {
+                    res->success = false;
+                    res->message = "Error: Column '" + select_items[i].column + "' does not exist in table.";
+                }
+                std::cout << "Error: Column '" << select_items[i].column
+                          << "' does not exist in table.\n";
+                delete meta;
+                return;
+            }
+        }
+    } else if (select_all) {
         for (int i = 0; i < meta->count; i++) {
             selected_indices.push_back(i);
         }
@@ -691,14 +1168,21 @@ void execute_select(const std::string& tab_name,
         res->is_select = true;
         res->schema = output_schema;
         res->rows = output_rows;
+        res->source_schema = full_schema;
+        res->source_rows = all_rows;
         res->strategy = "Linear Scan (No WHERE clause)";
     }
 
-    print_table(output_schema, output_rows);
+    if (res == nullptr) {
+        print_table(output_schema, output_rows);
+    }
 
     delete meta;
 }
 void process_select(std::vector<std::string>& token_vector, QueryResult* res) {
+    // What: turn SELECT tokens into either normal SELECT, WHERE SELECT, or JOIN execution.
+    // Why: parser tokenization is generic; this function understands SELECT clause order.
+    // Example: SELECT * FROM students WHERE id = 1; routes to execute_select_where().
     if (token_vector.size() < 4 || token_vector[0] != "select") {
         if (res) {
             res->success = false;
@@ -740,7 +1224,22 @@ void process_select(std::vector<std::string>& token_vector, QueryResult* res) {
         join_kw_index++;
     }
 
+    std::vector<AggregateExpr> aggregates;
+    bool aggregate_query = is_aggregate_select(target_cols, aggregates);
+    std::vector<SelectItem> select_items;
+    bool has_aggregate = false;
+    bool has_plain_column = false;
+    parse_select_items(target_cols, select_items, has_aggregate, has_plain_column);
+    QueryResult local_result;
+    QueryResult* target_result = (res != nullptr) ? res : &local_result;
+
     if ((int)token_vector.size() > join_kw_index && token_vector[join_kw_index] == "join") {
+        if (aggregate_query) {
+            target_result->success = false;
+            target_result->message = "Error: Aggregate functions over JOIN are not supported yet.";
+            std::cout << "Error: Aggregate functions over JOIN are not supported yet.\n";
+            return;
+        }
         if ((int)token_vector.size() < join_kw_index + 6) {
             std::cout << "Syntax Error: Incomplete JOIN.\n";
             std::cout << "Use: SELECT ... FROM t1 JOIN t2 ON t1.col = t2.col;\n";
@@ -764,46 +1263,103 @@ void process_select(std::vector<std::string>& token_vector, QueryResult* res) {
 
         bool where_present = false;
         std::string where_col, where_val;
-        int where_index = join_kw_index + 6;
-        if ((int)token_vector.size() > where_index) {
-            if (token_vector[where_index] != "where") {
-                std::cout << "Syntax Error: Only WHERE is allowed after JOIN ON clause.\n";
-                return;
-            }
-            if ((int)token_vector.size() < where_index + 4) {
+        SelectModifiers modifiers;
+        std::string group_by_column;
+        int cursor = join_kw_index + 6;
+
+        if ((int)token_vector.size() > cursor && token_vector[cursor] == "where") {
+            if ((int)token_vector.size() < cursor + 4) {
                 std::cout << "Syntax Error: Incomplete WHERE after JOIN.\n";
                 return;
             }
-            if (token_vector[where_index + 2] != "=") {
+            if (token_vector[cursor + 2] != "=") {
                 std::cout << "Syntax Error: Only '=' is supported in WHERE.\n";
                 return;
             }
 
             where_present = true;
-            where_col = token_vector[where_index + 1];
-            for (int i = where_index + 3; i < (int)token_vector.size(); ++i) {
-                if (!where_val.empty()) where_val += " ";
-                where_val += token_vector[i];
-            }
-            if (where_val.empty()) {
-                std::cout << "Syntax Error: Missing WHERE value.\n";
+            where_col = token_vector[cursor + 1];
+            where_val = token_vector[cursor + 3];
+            cursor += 4;
+        }
+
+        while ((int)token_vector.size() > cursor) {
+            if (token_vector[cursor] == "group") {
+                if ((int)token_vector.size() <= cursor + 2 || token_vector[cursor + 1] != "by") {
+                    std::cout << "Syntax Error: GROUP BY requires a column.\n";
+                    return;
+                }
+                group_by_column = token_vector[cursor + 2];
+                cursor += 3;
+            } else if (token_vector[cursor] == "order") {
+                if ((int)token_vector.size() <= cursor + 2 || token_vector[cursor + 1] != "by") {
+                    std::cout << "Syntax Error: ORDER BY requires a column.\n";
+                    return;
+                }
+                modifiers.has_order_by = true;
+                modifiers.order_by_column = token_vector[cursor + 2];
+                cursor += 3;
+                if ((int)token_vector.size() > cursor &&
+                    (token_vector[cursor] == "asc" || token_vector[cursor] == "desc")) {
+                    modifiers.order_desc = (token_vector[cursor] == "desc");
+                    cursor++;
+                }
+            } else if (token_vector[cursor] == "limit") {
+                if ((int)token_vector.size() <= cursor + 1) {
+                    std::cout << "Syntax Error: LIMIT requires a number.\n";
+                    return;
+                }
+                try {
+                    modifiers.limit = std::stoi(token_vector[cursor + 1]);
+                } catch (...) {
+                    std::cout << "Syntax Error: LIMIT must be an integer.\n";
+                    return;
+                }
+                cursor += 2;
+            } else {
+                std::cout << "Syntax Error: Unsupported clause after JOIN.\n";
                 return;
             }
         }
 
         execute_select_join_nested(target_cols, table_name, right_table, left_on, right_on,
                                    left_join,
-                                   where_present, where_col, where_val, res);
+                                   where_present, where_col, where_val, target_result);
+        if (!target_result->success) return;
+        if (!group_by_column.empty()) {
+            target_result->success = false;
+            target_result->message = "Error: GROUP BY over JOIN is not supported yet.";
+            std::cout << "Error: GROUP BY over JOIN is not supported yet.\n";
+            return;
+        }
+        if (!apply_aggregates(*target_result, aggregates)) {
+            target_result->success = false;
+            target_result->message = "Error: Invalid aggregate usage.";
+            std::cout << "Error: Invalid aggregate usage.\n";
+            return;
+        }
+        if (!apply_order_by_and_limit(*target_result, modifiers, aggregates)) {
+            target_result->success = false;
+            target_result->message = "Error: ORDER BY column not found in selected output.";
+            std::cout << "Error: ORDER BY column not found in selected output.\n";
+            return;
+        }
+        if (res == nullptr) {
+            print_table(target_result->schema, target_result->rows);
+        }
         return;
     }
 
     WhereClause where_clause;
+    SelectModifiers modifiers;
+    std::string group_by_column;
     int where_start = from_index + 2;
+    int cursor = where_start;
 
-    if ((int)token_vector.size() > where_start &&
-        token_vector[where_start] == "where") {
+    if ((int)token_vector.size() > cursor &&
+        token_vector[cursor] == "where") {
 
-        if ((int)token_vector.size() < where_start + 4) {
+        if ((int)token_vector.size() < cursor + 4) {
             if (res) {
                 res->success = false;
                 res->message = "Syntax Error: Incomplete WHERE clause.";
@@ -813,7 +1369,7 @@ void process_select(std::vector<std::string>& token_vector, QueryResult* res) {
             return;
         }
 
-        std::string op = token_vector[where_start + 2];
+        std::string op = token_vector[cursor + 2];
 
         if (op != "=") {
             if (res) {
@@ -825,18 +1381,10 @@ void process_select(std::vector<std::string>& token_vector, QueryResult* res) {
         }
 
         where_clause.present = true;
-        where_clause.column = token_vector[where_start + 1];
+        where_clause.column = token_vector[cursor + 1];
         where_clause.op = op;
-
-        // Join all remaining tokens after '=' as the WHERE value.
-        // This allows values like: Aditya Sirsalkar
-        where_clause.value = "";
-        for (int i = where_start + 3; i < (int)token_vector.size(); i++) {
-            if (!where_clause.value.empty()) {
-                where_clause.value += " ";
-            }
-            where_clause.value += token_vector[i];
-        }
+        where_clause.value = token_vector[cursor + 3];
+        cursor += 4;
 
         if (where_clause.value.empty()) {
             if (res) {
@@ -848,9 +1396,102 @@ void process_select(std::vector<std::string>& token_vector, QueryResult* res) {
         }
     }
 
+    while ((int)token_vector.size() > cursor) {
+        if (token_vector[cursor] == "group") {
+            if ((int)token_vector.size() <= cursor + 2 || token_vector[cursor + 1] != "by") {
+                if (res) {
+                    res->success = false;
+                    res->message = "Syntax Error: GROUP BY requires a column.";
+                }
+                std::cout << "Syntax Error: GROUP BY requires a column.\n";
+                return;
+            }
+            group_by_column = token_vector[cursor + 2];
+            cursor += 3;
+        } else if (token_vector[cursor] == "order") {
+            if ((int)token_vector.size() <= cursor + 2 || token_vector[cursor + 1] != "by") {
+                if (res) {
+                    res->success = false;
+                    res->message = "Syntax Error: ORDER BY requires a column.";
+                }
+                std::cout << "Syntax Error: ORDER BY requires a column.\n";
+                return;
+            }
+            modifiers.has_order_by = true;
+            modifiers.order_by_column = token_vector[cursor + 2];
+            cursor += 3;
+            if ((int)token_vector.size() > cursor &&
+                (token_vector[cursor] == "asc" || token_vector[cursor] == "desc")) {
+                modifiers.order_desc = (token_vector[cursor] == "desc");
+                cursor++;
+            }
+        } else if (token_vector[cursor] == "limit") {
+            if ((int)token_vector.size() <= cursor + 1) {
+                if (res) {
+                    res->success = false;
+                    res->message = "Syntax Error: LIMIT requires a number.";
+                }
+                std::cout << "Syntax Error: LIMIT requires a number.\n";
+                return;
+            }
+            try {
+                modifiers.limit = std::stoi(token_vector[cursor + 1]);
+            } catch (...) {
+                if (res) {
+                    res->success = false;
+                    res->message = "Syntax Error: LIMIT must be an integer.";
+                }
+                std::cout << "Syntax Error: LIMIT must be an integer.\n";
+                return;
+            }
+            cursor += 2;
+        } else {
+            if (res) {
+                res->success = false;
+                res->message = "Syntax Error: Unsupported trailing clause in SELECT.";
+            }
+            std::cout << "Syntax Error: Unsupported trailing clause in SELECT.\n";
+            return;
+        }
+    }
+
     if (where_clause.present) {
-        execute_select_where(table_name, target_cols, where_clause, res);
+        execute_select_where(table_name, target_cols, where_clause, target_result);
     } else {
-        execute_select(table_name, target_cols, res);
+        execute_select(table_name, target_cols, target_result);
+    }
+
+    if (!target_result->success) {
+        return;
+    }
+
+    if (!group_by_column.empty()) {
+        if (!apply_group_by(*target_result, select_items, group_by_column)) {
+            target_result->success = false;
+            target_result->message = "Error: Invalid GROUP BY usage.";
+            std::cout << "Error: Invalid GROUP BY usage.\n";
+            return;
+        }
+    } else if (has_plain_column && has_aggregate) {
+        target_result->success = false;
+        target_result->message = "Error: Mixed columns and aggregates require GROUP BY.";
+        std::cout << "Error: Mixed columns and aggregates require GROUP BY.\n";
+        return;
+    } else if (!apply_aggregates(*target_result, aggregates)) {
+        target_result->success = false;
+        target_result->message = "Error: Invalid aggregate usage.";
+        std::cout << "Error: Invalid aggregate usage.\n";
+        return;
+    }
+
+    if (!apply_order_by_and_limit(*target_result, modifiers, aggregates)) {
+        target_result->success = false;
+        target_result->message = "Error: ORDER BY column not found in selected output.";
+        std::cout << "Error: ORDER BY column not found in selected output.\n";
+        return;
+    }
+
+    if (res == nullptr) {
+        print_table(target_result->schema, target_result->rows);
     }
 }
