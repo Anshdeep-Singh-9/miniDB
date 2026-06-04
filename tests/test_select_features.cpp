@@ -34,12 +34,14 @@ int main() {
     run_query("INSERT INTO " + table + " VALUES (2, \"Riya\", \"ECE\");", result);
     run_query("INSERT INTO " + table + " VALUES (1, \"Aman\", \"CSE\");", result);
     run_query("INSERT INTO " + table + " VALUES (3, \"Zoya\", \"ME\");", result);
+    run_query("INSERT INTO " + table + " VALUES (4, \"Kabir\", \"CSE\");", result);
+    run_query("INSERT INTO " + table + " VALUES (5, \"Aman\", \"CSE\");", result);
 
     if (!run_query("SELECT * FROM " + table + " ORDER BY name;", result)) {
         std::cerr << result.message << "\n";
         return 1;
     }
-    if (!expect(result.rows.size() == 3, "ORDER BY should return 3 rows")) return 1;
+    if (!expect(result.rows.size() == 5, "ORDER BY should return 5 rows")) return 1;
     if (!expect(result.rows[0][1].string_value == "Aman", "ORDER BY failed")) return 1;
 
     if (!run_query("SELECT * FROM " + table + " LIMIT 2;", result)) {
@@ -52,22 +54,22 @@ int main() {
         std::cerr << result.message << "\n";
         return 1;
     }
-    if (!expect(result.rows.size() == 3, "Hidden ORDER BY should return 3 rows")) return 1;
+    if (!expect(result.rows.size() == 5, "Hidden ORDER BY should return 5 rows")) return 1;
     if (!expect(result.rows[0][0].string_value == "Aman", "ORDER BY hidden column failed")) return 1;
 
     if (!run_query("SELECT COUNT(*) FROM " + table + ";", result)) {
         std::cerr << result.message << "\n";
         return 1;
     }
-    if (!expect(result.rows.size() == 1 && result.rows[0][0].int_value == 3, "COUNT(*) failed")) return 1;
+    if (!expect(result.rows.size() == 1 && result.rows[0][0].int_value == 5, "COUNT(*) failed")) return 1;
 
     if (!run_query("SELECT SUM(id), AVG(id), MIN(name), MAX(name) FROM " + table + ";", result)) {
         std::cerr << result.message << "\n";
         return 1;
     }
     if (!expect(result.rows.size() == 1, "Aggregate query should return 1 row")) return 1;
-    if (!expect(result.rows[0][0].int_value == 6, "SUM(id) failed")) return 1;
-    if (!expect(result.rows[0][1].int_value == 2, "AVG(id) failed")) return 1;
+    if (!expect(result.rows[0][0].int_value == 15, "SUM(id) failed")) return 1;
+    if (!expect(result.rows[0][1].int_value == 3, "AVG(id) failed")) return 1;
     if (!expect(result.rows[0][2].string_value == "Aman", "MIN(name) failed")) return 1;
     if (!expect(result.rows[0][3].string_value == "Zoya", "MAX(name) failed")) return 1;
 
@@ -76,7 +78,24 @@ int main() {
         return 1;
     }
     if (!expect(result.rows.size() == 3, "GROUP BY should return 3 groups")) return 1;
-    if (!expect(result.rows[0][0].string_value == "CSE" && result.rows[0][1].int_value == 1, "GROUP BY CSE failed")) return 1;
+    if (!expect(result.rows[0][0].string_value == "CSE" && result.rows[0][1].int_value == 3, "GROUP BY CSE failed")) return 1;
+
+    if (!run_query("SELECT dept, COUNT(*) FROM " + table + " GROUP BY dept HAVING COUNT(*) > 1 ORDER BY dept;", result)) {
+        std::cerr << result.message << "\n";
+        return 1;
+    }
+    if (!expect(result.rows.size() == 1, "HAVING should keep only one group")) return 1;
+    if (!expect(result.rows[0][0].string_value == "CSE" && result.rows[0][1].int_value == 3, "HAVING COUNT(*) > 1 failed")) return 1;
+
+    if (!run_query("SELECT dept, name, COUNT(*) FROM " + table + " GROUP BY dept, name ORDER BY dept;", result)) {
+        std::cerr << result.message << "\n";
+        return 1;
+    }
+    if (!expect(result.rows.size() == 4, "Multi-column GROUP BY should return 4 groups")) return 1;
+    if (!expect(result.rows[0][0].string_value == "CSE" &&
+                result.rows[0][1].string_value == "Aman" &&
+                result.rows[0][2].int_value == 2,
+                "Multi-column GROUP BY failed for CSE/Aman")) return 1;
 
     run_query("DROP TABLE " + table + ";", result);
     return 0;

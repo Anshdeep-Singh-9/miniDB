@@ -30,6 +30,13 @@ struct SelectModifiers {
     int limit = -1;
 };
 
+struct HavingClause {
+    bool present = false;
+    std::string left_expr;
+    std::string op;
+    std::string right_value;
+};
+
 struct AggregateExpr {
     std::string func;
     std::string column;
@@ -61,6 +68,22 @@ bool tuple_less(const TupleValue& a, const TupleValue& b) {
         return std::to_string(a.int_value) < b.string_value;
     }
     return a.string_value < std::to_string(b.int_value);
+}
+
+bool tuple_equals(const TupleValue& a, const TupleValue& b) {
+    if (a.type == STORAGE_COLUMN_INT && b.type == STORAGE_COLUMN_INT) {
+        return a.int_value == b.int_value;
+    }
+    if (a.type == STORAGE_COLUMN_VARCHAR && b.type == STORAGE_COLUMN_VARCHAR) {
+        return a.string_value == b.string_value;
+    }
+    if (a.type == STORAGE_COLUMN_INT && b.type == STORAGE_COLUMN_VARCHAR) {
+        return std::to_string(a.int_value) == b.string_value;
+    }
+    if (a.type == STORAGE_COLUMN_VARCHAR && b.type == STORAGE_COLUMN_INT) {
+        return a.string_value == std::to_string(b.int_value);
+    }
+    return false;
 }
 
 bool parse_aggregate_expr(const std::string& token, AggregateExpr& expr) {
@@ -199,6 +222,91 @@ bool apply_order_by_and_limit(QueryResult& result,
     return true;
 }
 
+bool parse_having_clause(const std::vector<std::string>& token_vector,
+                         int cursor,
+                         HavingClause& having,
+                         int& next_cursor) {
+    having = HavingClause();
+    next_cursor = cursor;
+
+    if ((int)token_vector.size() <= cursor || token_vector[cursor] != "having") {
+        return true;
+    }
+
+    if ((int)token_vector.size() <= cursor + 3) {
+        return false;
+    }
+
+    having.present = true;
+    having.left_expr = token_vector[cursor + 1];
+    having.op = token_vector[cursor + 2];
+    having.right_value = token_vector[cursor + 3];
+
+    if (having.op != "=" && having.op != "!=" && having.op != "<>" &&
+        having.op != ">" && having.op != "<" &&
+        having.op != ">=" && having.op != "<=") {
+        return false;
+    }
+
+    next_cursor = cursor + 4;
+    return true;
+}
+
+bool compare_tuple_value(const TupleValue& lhs,
+                         const std::string& op,
+                         const std::string& rhs_raw) {
+    if (lhs.type == STORAGE_COLUMN_INT) {
+        int rhs = 0;
+        try {
+            rhs = std::stoi(rhs_raw);
+        } catch (...) {
+            return false;
+        }
+        TupleValue rhs_value = TupleValue::FromInt(rhs);
+        if (op == "=") return tuple_equals(lhs, rhs_value);
+        if (op == "!=" || op == "<>") return !tuple_equals(lhs, rhs_value);
+        if (op == ">") return lhs.int_value > rhs;
+        if (op == "<") return lhs.int_value < rhs;
+        if (op == ">=") return lhs.int_value >= rhs;
+        if (op == "<=") return lhs.int_value <= rhs;
+        return false;
+    }
+
+    TupleValue rhs_value = TupleValue::FromVarchar(rhs_raw);
+    if (op == "=") return tuple_equals(lhs, rhs_value);
+    if (op == "!=" || op == "<>") return !tuple_equals(lhs, rhs_value);
+    if (op == ">") return lhs.string_value > rhs_raw;
+    if (op == "<") return lhs.string_value < rhs_raw;
+    if (op == ">=") return lhs.string_value >= rhs_raw;
+    if (op == "<=") return lhs.string_value <= rhs_raw;
+    return false;
+}
+
+bool apply_having(QueryResult& result, const HavingClause& having) {
+    if (!having.present) return true;
+
+    int having_idx = find_schema_column(result.schema, having.left_expr);
+    if (having_idx < 0) {
+        return false;
+    }
+
+    std::vector<std::vector<TupleValue>> filtered_rows;
+    filtered_rows.reserve(result.rows.size());
+    for (std::size_t i = 0; i < result.rows.size(); ++i) {
+        if (having_idx >= (int)result.rows[i].size()) {
+            return false;
+        }
+        if (compare_tuple_value(result.rows[i][having_idx], having.op, having.right_value)) {
+            filtered_rows.push_back(result.rows[i]);
+        }
+    }
+
+    result.rows.swap(filtered_rows);
+    result.source_schema = result.schema;
+    result.source_rows = result.rows;
+    return true;
+}
+
 std::string group_key_for_value(const TupleValue& value) {
     if (value.type == STORAGE_COLUMN_INT) {
         return "I:" + std::to_string(value.int_value);
@@ -206,39 +314,57 @@ std::string group_key_for_value(const TupleValue& value) {
     return "S:" + value.string_value;
 }
 
+bool is_select_clause_keyword(const std::string& token) {
+    return token == "having" || token == "order" || token == "limit";
+}
+
 bool apply_group_by(QueryResult& result,
                     const std::vector<SelectItem>& items,
-                    const std::string& group_by_column) {
-    if (group_by_column.empty()) return true;
+                    const std::vector<std::string>& group_by_columns) {
+    if (group_by_columns.empty()) return true;
     if (result.source_schema.empty()) return false;
 
-    int group_idx = find_schema_column(result.source_schema, group_by_column);
-    if (group_idx < 0) return false;
+    std::vector<int> group_indices;
+    group_indices.reserve(group_by_columns.size());
+    for (std::size_t i = 0; i < group_by_columns.size(); ++i) {
+        int group_idx = find_schema_column(result.source_schema, group_by_columns[i]);
+        if (group_idx < 0) return false;
+        group_indices.push_back(group_idx);
+    }
 
-    bool seen_group_column = false;
     for (std::size_t i = 0; i < items.size(); ++i) {
-        if (!items[i].is_aggregate && items[i].column == group_by_column) {
-            seen_group_column = true;
-        } else if (!items[i].is_aggregate) {
-            return false;
+        if (!items[i].is_aggregate) {
+            bool found = false;
+            for (std::size_t g = 0; g < group_by_columns.size(); ++g) {
+                if (items[i].column == group_by_columns[g]) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) return false;
         }
     }
-    if (!seen_group_column) return false;
 
     struct GroupBucket {
-        TupleValue group_value;
+        std::vector<TupleValue> group_values;
         std::vector<std::vector<TupleValue>> rows;
     };
 
     std::vector<GroupBucket> buckets;
     std::unordered_map<std::string, std::size_t> bucket_index;
     for (std::size_t r = 0; r < result.source_rows.size(); ++r) {
-        const TupleValue& key_value = result.source_rows[r][group_idx];
-        const std::string key = group_key_for_value(key_value);
+        std::string key;
+        std::vector<TupleValue> key_values;
+        for (std::size_t g = 0; g < group_indices.size(); ++g) {
+            const TupleValue& key_value = result.source_rows[r][group_indices[g]];
+            if (!key.empty()) key += "|";
+            key += group_key_for_value(key_value);
+            key_values.push_back(key_value);
+        }
         std::unordered_map<std::string, std::size_t>::iterator found = bucket_index.find(key);
         if (found == bucket_index.end()) {
             GroupBucket bucket;
-            bucket.group_value = key_value;
+            bucket.group_values = key_values;
             bucket.rows.push_back(result.source_rows[r]);
             bucket_index[key] = buckets.size();
             buckets.push_back(bucket);
@@ -252,7 +378,9 @@ bool apply_group_by(QueryResult& result,
 
     for (std::size_t i = 0; i < items.size(); ++i) {
         if (!items[i].is_aggregate) {
-            grouped_schema.push_back(result.source_schema[group_idx]);
+            int plain_idx = find_schema_column(result.source_schema, items[i].column);
+            if (plain_idx < 0) return false;
+            grouped_schema.push_back(result.source_schema[plain_idx]);
             grouped_schema.back().name = items[i].label;
         } else {
             const std::string lower_func = to_lower_copy(items[i].func);
@@ -271,7 +399,15 @@ bool apply_group_by(QueryResult& result,
         std::vector<TupleValue> out_row;
         for (std::size_t i = 0; i < items.size(); ++i) {
             if (!items[i].is_aggregate) {
-                out_row.push_back(buckets[b].group_value);
+                int plain_group_pos = -1;
+                for (std::size_t g = 0; g < group_by_columns.size(); ++g) {
+                    if (items[i].column == group_by_columns[g]) {
+                        plain_group_pos = static_cast<int>(g);
+                        break;
+                    }
+                }
+                if (plain_group_pos < 0) return false;
+                out_row.push_back(buckets[b].group_values[plain_group_pos]);
                 continue;
             }
 
@@ -1264,7 +1400,8 @@ void process_select(std::vector<std::string>& token_vector, QueryResult* res) {
         bool where_present = false;
         std::string where_col, where_val;
         SelectModifiers modifiers;
-        std::string group_by_column;
+        std::vector<std::string> group_by_columns;
+        HavingClause having;
         int cursor = join_kw_index + 6;
 
         if ((int)token_vector.size() > cursor && token_vector[cursor] == "where") {
@@ -1289,8 +1426,20 @@ void process_select(std::vector<std::string>& token_vector, QueryResult* res) {
                     std::cout << "Syntax Error: GROUP BY requires a column.\n";
                     return;
                 }
-                group_by_column = token_vector[cursor + 2];
-                cursor += 3;
+                cursor += 2;
+                while ((int)token_vector.size() > cursor && !is_select_clause_keyword(token_vector[cursor])) {
+                    group_by_columns.push_back(token_vector[cursor]);
+                    cursor++;
+                }
+                if (group_by_columns.empty()) {
+                    std::cout << "Syntax Error: GROUP BY requires at least one column.\n";
+                    return;
+                }
+            } else if (token_vector[cursor] == "having") {
+                if (!parse_having_clause(token_vector, cursor, having, cursor)) {
+                    std::cout << "Syntax Error: HAVING must be of the form HAVING expr op value.\n";
+                    return;
+                }
             } else if (token_vector[cursor] == "order") {
                 if ((int)token_vector.size() <= cursor + 2 || token_vector[cursor + 1] != "by") {
                     std::cout << "Syntax Error: ORDER BY requires a column.\n";
@@ -1326,10 +1475,16 @@ void process_select(std::vector<std::string>& token_vector, QueryResult* res) {
                                    left_join,
                                    where_present, where_col, where_val, target_result);
         if (!target_result->success) return;
-        if (!group_by_column.empty()) {
+        if (!group_by_columns.empty()) {
             target_result->success = false;
             target_result->message = "Error: GROUP BY over JOIN is not supported yet.";
             std::cout << "Error: GROUP BY over JOIN is not supported yet.\n";
+            return;
+        }
+        if (having.present) {
+            target_result->success = false;
+            target_result->message = "Error: HAVING over JOIN is not supported yet.";
+            std::cout << "Error: HAVING over JOIN is not supported yet.\n";
             return;
         }
         if (!apply_aggregates(*target_result, aggregates)) {
@@ -1352,7 +1507,8 @@ void process_select(std::vector<std::string>& token_vector, QueryResult* res) {
 
     WhereClause where_clause;
     SelectModifiers modifiers;
-    std::string group_by_column;
+    std::vector<std::string> group_by_columns;
+    HavingClause having;
     int where_start = from_index + 2;
     int cursor = where_start;
 
@@ -1406,8 +1562,28 @@ void process_select(std::vector<std::string>& token_vector, QueryResult* res) {
                 std::cout << "Syntax Error: GROUP BY requires a column.\n";
                 return;
             }
-            group_by_column = token_vector[cursor + 2];
-            cursor += 3;
+            cursor += 2;
+            while ((int)token_vector.size() > cursor && !is_select_clause_keyword(token_vector[cursor])) {
+                group_by_columns.push_back(token_vector[cursor]);
+                cursor++;
+            }
+            if (group_by_columns.empty()) {
+                if (res) {
+                    res->success = false;
+                    res->message = "Syntax Error: GROUP BY requires at least one column.";
+                }
+                std::cout << "Syntax Error: GROUP BY requires at least one column.\n";
+                return;
+            }
+        } else if (token_vector[cursor] == "having") {
+            if (!parse_having_clause(token_vector, cursor, having, cursor)) {
+                if (res) {
+                    res->success = false;
+                    res->message = "Syntax Error: HAVING must be of the form HAVING expr op value.";
+                }
+                std::cout << "Syntax Error: HAVING must be of the form HAVING expr op value.\n";
+                return;
+            }
         } else if (token_vector[cursor] == "order") {
             if ((int)token_vector.size() <= cursor + 2 || token_vector[cursor + 1] != "by") {
                 if (res) {
@@ -1465,8 +1641,8 @@ void process_select(std::vector<std::string>& token_vector, QueryResult* res) {
         return;
     }
 
-    if (!group_by_column.empty()) {
-        if (!apply_group_by(*target_result, select_items, group_by_column)) {
+    if (!group_by_columns.empty()) {
+        if (!apply_group_by(*target_result, select_items, group_by_columns)) {
             target_result->success = false;
             target_result->message = "Error: Invalid GROUP BY usage.";
             std::cout << "Error: Invalid GROUP BY usage.\n";
@@ -1481,6 +1657,13 @@ void process_select(std::vector<std::string>& token_vector, QueryResult* res) {
         target_result->success = false;
         target_result->message = "Error: Invalid aggregate usage.";
         std::cout << "Error: Invalid aggregate usage.\n";
+        return;
+    }
+
+    if (!apply_having(*target_result, having)) {
+        target_result->success = false;
+        target_result->message = "Error: Invalid HAVING usage.";
+        std::cout << "Error: Invalid HAVING usage.\n";
         return;
     }
 
