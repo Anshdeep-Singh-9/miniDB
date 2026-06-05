@@ -4,6 +4,7 @@ namespace fs = std::filesystem;
 namespace {
 std::string g_active_user;
 std::string g_active_database;
+const char* kDefaultDatabaseName = "DB1";
 
 fs::path resolve_project_root() {
     // What: find the repository root even when binary runs from build/bin or Docker.
@@ -47,6 +48,101 @@ std::string sanitize_user_component(const std::string& username) {
     return cleaned;
 }
 
+std::vector<std::string> scan_database_directories() {
+    std::vector<std::string> names;
+    std::error_code ec;
+    const fs::path root = databases_root();
+    if (!fs::exists(root) || !fs::is_directory(root)) {
+        return names;
+    }
+
+    for (fs::directory_iterator it(root, ec); !ec && it != fs::directory_iterator(); ++it) {
+        if (!fs::is_directory(it->path())) continue;
+        names.push_back(it->path().filename().string());
+    }
+
+    std::sort(names.begin(), names.end());
+    names.erase(std::unique(names.begin(), names.end()), names.end());
+    return names;
+}
+
+bool rewrite_database_list_file(const std::vector<std::string>& names) {
+    std::error_code ec;
+    fs::create_directories(database_list_path().parent_path(), ec);
+    if (ec) return false;
+
+    std::ofstream out(database_list_path(), std::ios::trunc);
+    if (!out.is_open()) return false;
+    for (std::size_t i = 0; i < names.size(); ++i) {
+        out << names[i] << "\n";
+    }
+    return true;
+}
+
+bool migrate_legacy_user_layout() {
+    if (g_active_user.empty()) return true;
+
+    std::error_code ec;
+    const fs::path legacy_table = user_root() / "table";
+    const fs::path legacy_system = user_root() / "system";
+    const fs::path legacy_default = databases_root() / "default";
+    const fs::path db1_root = databases_root() / kDefaultDatabaseName;
+
+    if (fs::exists(legacy_default) && !fs::exists(db1_root)) {
+        fs::create_directories(databases_root(), ec);
+        if (ec) return false;
+        fs::rename(legacy_default, db1_root, ec);
+        if (ec) return false;
+    }
+
+    if (fs::exists(legacy_table) || fs::exists(legacy_system)) {
+        fs::create_directories(db1_root, ec);
+        if (ec) return false;
+
+        if (fs::exists(legacy_table) && !fs::exists(db1_root / "table")) {
+            fs::rename(legacy_table, db1_root / "table", ec);
+            if (ec) return false;
+        }
+
+        if (fs::exists(legacy_system) && !fs::exists(db1_root / "system")) {
+            fs::rename(legacy_system, db1_root / "system", ec);
+            if (ec) return false;
+        }
+    }
+
+    if (fs::exists(db1_root)) {
+        fs::create_directories(db1_root / "table", ec);
+        if (ec) return false;
+        fs::create_directories(db1_root / "system", ec);
+        if (ec) return false;
+
+        const fs::path db1_table_list = db1_root / "table" / "table_list";
+        if (!fs::exists(db1_table_list)) {
+            std::ofstream out(db1_table_list);
+            if (!out.is_open()) return false;
+        }
+    }
+
+    std::vector<std::string> names = scan_database_directories();
+    bool has_db1 = false;
+    for (std::size_t i = 0; i < names.size(); ++i) {
+        if (names[i] == kDefaultDatabaseName) {
+            has_db1 = true;
+            break;
+        }
+    }
+    if (!has_db1 && (fs::exists(db1_root))) {
+        names.push_back(kDefaultDatabaseName);
+        std::sort(names.begin(), names.end());
+    }
+
+    if (!rewrite_database_list_file(names)) {
+        return false;
+    }
+
+    return true;
+}
+
 }
 
 fs::path project_root() {
@@ -72,7 +168,7 @@ fs::path database_root() {
         return project_root();
     }
     if (g_active_database.empty()) {
-        return databases_root() / "default";
+        return databases_root() / kDefaultDatabaseName;
     }
     return databases_root() / sanitize_user_component(g_active_database);
 }
@@ -128,6 +224,7 @@ fs::path txn_snapshot_root() {
 
 void set_active_user(const std::string& username) {
     g_active_user = username;
+    g_active_database.clear();
 }
 
 std::string active_user() {
@@ -157,6 +254,14 @@ std::vector<std::string> list_databases() {
     std::string name;
     while (in >> name) {
         names.push_back(name);
+    }
+    if (!names.empty()) {
+        return names;
+    }
+
+    names = scan_database_directories();
+    if (!names.empty()) {
+        rewrite_database_list_file(names);
     }
     return names;
 }
@@ -223,9 +328,34 @@ bool drop_database_namespace(const std::string& db_name) {
 
 bool ensure_default_database_for_active_user() {
     if (g_active_user.empty()) return true;
-    if (!create_database_namespace("default")) return false;
+    std::error_code ec;
+    fs::create_directories(user_root(), ec);
+    if (ec) return false;
+    fs::create_directories(databases_root(), ec);
+    if (ec) return false;
+
+    if (!migrate_legacy_user_layout()) return false;
+
+    std::vector<std::string> names = list_databases();
+    if (names.empty()) {
+        if (!create_database_namespace(kDefaultDatabaseName)) return false;
+        names.push_back(kDefaultDatabaseName);
+    }
+
+    bool has_db1 = false;
+    for (std::size_t i = 0; i < names.size(); ++i) {
+        if (names[i] == kDefaultDatabaseName) {
+            has_db1 = true;
+            break;
+        }
+    }
+    if (!has_db1) {
+        if (!create_database_namespace(kDefaultDatabaseName)) return false;
+        names = list_databases();
+    }
+
     if (g_active_database.empty()) {
-        g_active_database = "default";
+        g_active_database = has_db1 ? kDefaultDatabaseName : names.front();
     }
     return true;
 }

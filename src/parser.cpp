@@ -10,6 +10,7 @@
 #include "lock_manager.h"
 #include "auth.h"
 #include "recovery_manager.h"
+#include "alter.h"
 
 #include <cstring>
 #include <iostream>
@@ -74,6 +75,11 @@ class StatementLockGuard {
 // What: create.cpp function that performs actual table creation.
 // Example: parser sends table_name="students" and columns=[("id","INT"), ...].
 extern void execute_create_query(string table_name, vector<pair<string, string>> cols);
+extern bool execute_alter_add_column(const std::string& table_name,
+                                     const std::string& column_name,
+                                     const std::string& type_spec,
+                                     bool has_default,
+                                     const std::string& default_value);
 
 // What: insert.cpp function that writes validated row values to storage.
 // Example: parser sends table "students", schema, and values [1, "Aryan", "CSE"].
@@ -182,6 +188,7 @@ void push_select_token(vector<string>& token_vector, string token) {
     string lower = to_lower_string(token);
     if (lower == "select" || lower == "from" || lower == "where" ||
         lower == "join" || lower == "on" || lower == "left" || lower == "inner" ||
+        lower == "having" ||
         lower == "group" || lower == "order" || lower == "by" || lower == "limit" ||
         lower == "asc" || lower == "desc") {
         token_vector.push_back(lower);
@@ -701,6 +708,64 @@ void tokenize_update(char query[]) {
     execute_update(stmt);
 }
 
+void tokenize_alter(char query[]) {
+    std::string q(query);
+    while (!q.empty() && (q.back() == ';' || q.back() == '\n' || q.back() == ' ')) {
+        q.pop_back();
+    }
+
+    std::string q_lower = keyword_lower_copy(q);
+    const std::string prefix = "alter table ";
+    if (q_lower.rfind(prefix, 0) != 0) {
+        std::cout << "Syntax Error: Use ALTER TABLE table_name ADD COLUMN col TYPE [DEFAULT value];\n";
+        return;
+    }
+
+    std::size_t add_col_pos = q_lower.find(" add column ");
+    if (add_col_pos == std::string::npos) {
+        std::cout << "Syntax Error: Currently only ALTER TABLE ... ADD COLUMN ... is supported.\n";
+        return;
+    }
+
+    std::string table_name = trim_string(q.substr(prefix.size(), add_col_pos - prefix.size()));
+    std::string remainder = trim_string(q.substr(add_col_pos + 12));
+    if (table_name.empty() || remainder.empty()) {
+        std::cout << "Syntax Error: Incomplete ALTER TABLE statement.\n";
+        return;
+    }
+
+    std::stringstream ss(remainder);
+    std::string column_name;
+    ss >> column_name;
+    if (column_name.empty()) {
+        std::cout << "Syntax Error: Missing column name in ALTER TABLE.\n";
+        return;
+    }
+
+    std::string after_column = trim_string(remainder.substr(column_name.size()));
+    if (after_column.empty()) {
+        std::cout << "Syntax Error: Missing type in ALTER TABLE ADD COLUMN.\n";
+        return;
+    }
+
+    std::string default_value;
+    bool has_default = false;
+    std::string type_spec = after_column;
+    std::size_t default_pos = keyword_lower_copy(after_column).find(" default ");
+    if (default_pos != std::string::npos) {
+        type_spec = trim_string(after_column.substr(0, default_pos));
+        default_value = trim_string(after_column.substr(default_pos + 9));
+        has_default = true;
+    }
+
+    if (type_spec.empty()) {
+        std::cout << "Syntax Error: Missing type in ALTER TABLE ADD COLUMN.\n";
+        return;
+    }
+
+    execute_alter_add_column(table_name, column_name, type_spec, has_default, default_value);
+}
+
 // What: parse DELETE FROM ... WHERE ... into DeleteStatement.
 // Why: delete.cpp can then choose indexed or scan-based delete.
 void tokenize_delete(char query[]) {
@@ -762,6 +827,7 @@ void print_query_syntax_help() {
     cout << "CREATE DATABASE semester4;\n";
     cout << "CREATE TABLE students (id INT, name VARCHAR(50), dept VARCHAR(20));\n";
     cout << "CREATE USER kairo IDENTIFIED BY \"pass123\";\n";
+    cout << "ALTER TABLE students ADD COLUMN age INT DEFAULT 18;\n";
     cout << "INSERT INTO students VALUES (1, \"Aditya\", \"CSE\");\n";
     cout << "SELECT * FROM students;\n";
     cout << "SELECT name, dept FROM students;\n";
@@ -770,6 +836,8 @@ void print_query_syntax_help() {
     cout << "SELECT * FROM students LIMIT 5;\n";
     cout << "SELECT COUNT(*) FROM students;\n";
     cout << "SELECT SUM(id), AVG(id), MIN(name), MAX(name) FROM students;\n";
+    cout << "SELECT dept, COUNT(*) FROM students GROUP BY dept HAVING COUNT(*) > 1;\n";
+    cout << "SELECT dept, name, COUNT(*) FROM students GROUP BY dept, name;\n";
     cout << "SELECT students.name, departments.hod FROM students JOIN departments ON students.dept = departments.code;\n";
     cout << "SELECT students.name, departments.hod FROM students LEFT JOIN departments ON students.dept = departments.code;\n";
     cout << "UPDATE students SET dept = ECE WHERE id = 1;\n";
@@ -874,6 +942,19 @@ void execute_query_string(string input_query, QueryResult* res) {
             tokenize_create(final_query);
             if (res) res->message = "Table created successfully";
         }
+    }
+    else if (token_temp == "alter") {
+        StatementLockGuard guard;
+        if (!guard.lock_for_write()) {
+            cout << "Concurrency error: active transaction does not hold write lock.\n";
+            if (res) {
+                res->success = false;
+                res->message = "Concurrency error: active transaction does not hold write lock.";
+            }
+            return;
+        }
+        tokenize_alter(final_query);
+        if (res) res->message = "ALTER TABLE executed successfully";
     }
     else if (token_temp == "use") {
         StatementLockGuard guard;

@@ -18,7 +18,7 @@ int main() {
 
     set_active_user(user);
     ensure_default_database_for_active_user();
-    set_active_database("default");
+    set_active_database("DB1");
     system_check();
 
     execute_query_string("DROP DATABASE analytics;");
@@ -45,7 +45,7 @@ int main() {
         return 1;
     }
 
-    execute_query_string("USE default;");
+    execute_query_string("USE DB1;");
     if (!fs::exists(table_dir_path("root_table") / "met")) {
         std::cerr << "default db table missing after switch back\n";
         return 1;
