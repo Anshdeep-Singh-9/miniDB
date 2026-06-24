@@ -127,9 +127,7 @@ node test/client_test.js Students
 
 ---
 
-## 📝 Technical Note: Statelessness
-The API is **stateless**. This means each request is independent. The server does not maintain a persistent connection or "login session" for the API. Every time a request is made to `/table/<name>`, the server:
-1. Locates the table metadata.
-2. Reads the data blocks from the disk.
-3. Serializes the records into JSON.
-4. Returns the response and closes the task.
+## 📝 Technical Note: Session Tokens
+The API uses token-based sessions. Clients first call `POST /login` with a username and password. After a successful login, the server returns a session token that must be sent on protected requests using the `X-Session-Token` header.
+
+Each request is still handled independently at the HTTP level. For example, when `/table/<name>` is requested, the server validates the token, locates the table metadata, reads the data pages from disk, serializes the rows to JSON, and returns the response.
