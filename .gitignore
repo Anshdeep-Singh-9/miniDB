@@ -1,5 +1,8 @@
 build/
 table/
+.DS_Store
+system/
+docker-data/
 
 include/crow_all.h
 include/asio/
@@ -16,4 +19,3 @@ server
 miniDB
 context.md
 multi_database.md
-system
